@@ -17,6 +17,8 @@ import aiomysql
 import re
 from collections import defaultdict
 from discord.ui import View, Button
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Logging Setup ---
 log_dir = "logs"
@@ -94,6 +96,192 @@ async def safe_db_call(func, *args, **kwargs):
             logging.error(f"[DB Retry] Unexpected error: {e}")
             return None
 
+#Google Spreadsheet hook
+
+def sync_from_google_sheet():
+    try:
+        # Setup access to Google Sheets
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("google_creds.json", scope)
+        client = gspread.authorize(creds)
+
+        # Open the BWRL_RBR spreadsheet
+        spreadsheet = client.open("BWRL_RBR")
+
+        # === Get Latest Rally Config from Form Sheet ===
+        form_sheet = spreadsheet.sheet1
+        records = form_sheet.get_all_records()
+
+        if not records:
+            print("⚠️ No data found in main sheet.")
+            return False
+
+        latest = records[-1]
+        print(f"📥 Syncing rally config: {latest}")
+
+        season = int(latest['Season Number'])
+        week = int(latest['Week Number'])
+        sw_prefix = f"S{season}W{week}"
+
+        # === Build new environment variables ===
+        new_env_vars = {
+            f"{sw_prefix}_LEADERBOARD": latest.get("Leaderboard URL", "").strip()
+        }
+
+        # Add rally name only if "New Rally Name" exists
+        rally_name_from_sheet = latest.get("New Rally Name", "").strip()
+        if rally_name_from_sheet:
+            new_env_vars["RALLY_NAME"] = rally_name_from_sheet
+
+        # Add leg URLs
+        for key, value in latest.items():
+            if "LEG" in key.upper() and "URL" in key.upper() and value.strip():
+                leg_stage = key.upper().replace("LEG ", "LEG_").replace("STAGE ", "").replace(" URL", "").replace("  ", " ")
+                leg_stage = "_".join(leg_stage.split())
+                full_key = f"{sw_prefix}_{leg_stage}"
+                new_env_vars[full_key] = value.strip()
+
+        # === Load existing .env file ===
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        env_dict = {}
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        env_dict[k] = v
+
+        # Merge with new vars (overwrites if keys exist)
+        env_dict.update(new_env_vars)
+
+        # Write the updated .env file
+        with open(env_path, "w", encoding="utf-8") as f:
+            for k, v in env_dict.items():
+                f.write(f"{k}={v}\n")
+
+        print(f"✅ .env file updated with S{season}W{week} config")
+
+        # 🔁 Re-load the updated env values into memory
+        load_dotenv(override=True)
+        print("🧪 Reloaded .env → RALLY_NAME =", os.getenv("RALLY_NAME"))
+
+        # === Write standings from "Standings" tab to standings.csv ===
+        try:
+            standings_sheet = spreadsheet.worksheet("Standings")
+            standings_data = standings_sheet.get_all_values()
+
+            standings_path = os.path.join(os.path.dirname(__file__), "standings.csv")
+            with open(standings_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                for row in standings_data:
+                    writer.writerow(row)
+
+            print(f"✅ standings.csv updated from 'Standings' tab")
+        except Exception as e:
+            print(f"❌ Failed to update standings.csv: {e}")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ sync_from_google_sheet() failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+
+
+
+# Syncing with Google Handler
+# Replace this with your actual Discord ID(s)
+ALLOWED_SYNC_USERS = [
+    111111111111111111,  # User 1
+    222222222222222222,  # User 2
+    133333333333333333   # User 3
+]
+
+async def handle_sync_command(message):
+    if message.author.id not in ALLOWED_SYNC_USERS:
+        await message.channel.send("❌ You don’t have permission to use this command.")
+        return
+
+    try:
+        await message.channel.send("🔄 Syncing latest rally data from Google Sheets...")
+
+        # Detect current latest week before sync
+        previous_weeks = get_all_season_weeks()
+        previous_latest = previous_weeks[-1] if previous_weeks else None
+
+        # Perform sync
+        success = sync_from_google_sheet()
+
+        if not success:
+            await message.channel.send("⚠️ Sync failed. Check logs for more details.")
+            return
+
+        # Check if a new week was added
+        updated_weeks = get_all_season_weeks()
+        updated_latest = updated_weeks[-1] if updated_weeks else None
+
+        summary_lines = []
+        if updated_latest and updated_latest != previous_latest:
+            season, week = parse_season_week_key(updated_latest)
+            summary_lines.append(f"🆕 **New Week Detected:** Season {season}, Week {week}")
+            scraped_tracks = 0
+            failed_tracks = 0
+
+            # Scrape leg stages
+            leg_urls = build_urls_for_week(season, week)
+            for leg, stages in leg_urls.items():
+                for stage, url in stages.items():
+                    if url:
+                        leaderboard = scrape_leaderboard(url)
+                        if leaderboard:
+                            track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
+                            await safe_db_call(update_previous_leader, track_name, leaderboard[0]["name"])
+                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
+                            scraped_tracks += 1
+                        else:
+                            failed_tracks += 1
+
+            # Scrape general leaderboard
+            leaderboard_url = get_leaderboard_url(season, week)
+            if leaderboard_url:
+                general_leaderboard, soup = scrape_general_leaderboard(leaderboard_url)
+                if general_leaderboard:
+                    await safe_db_call(log_general_leaderboard_to_db, season, week, soup)
+                    summary_lines.append(f"📊 General leaderboard scraped and logged.")
+                else:
+                    summary_lines.append(f"⚠️ Failed to scrape general leaderboard.")
+
+            summary_lines.append(f"📈 Leg stages scraped: {scraped_tracks}")
+            if failed_tracks:
+                summary_lines.append(f"⚠️ Failed to scrape {failed_tracks} leg stage(s).")
+
+        else:
+            summary_lines.append("✅ No new week found. Existing week data remains unchanged.")
+
+        await message.channel.send(
+            "✅ Successfully synced from Google Sheets!\n"
+            "• `.env` file updated\n"
+            "• `standings.csv` updated\n"
+            "• `!info` and `!points` now reflect the latest data"
+        )
+
+        # Send detailed summary
+        embed = discord.Embed(
+            title="📦 Sync Summary",
+            description="\n".join(summary_lines),
+            color=discord.Color.green()
+        )
+        await message.channel.send(embed=embed)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logging.error(f"[ERROR] Sync command failed: {e}")
+        await message.channel.send("❌ Sync failed due to an internal error.")
+
 
 # (Rest of the code continues, properly cleaned up...)
 
@@ -141,9 +329,8 @@ async def get_previous_leader(track_name):
 async def show_driver_results(driver_name, season=None, week=None):
     try:
         if season is None or week is None:
-            latest = get_all_season_weeks()[-1]
-            season = int(latest[1])
-            week = int(latest[3:])
+            season, week = get_latest_season_and_week()
+
 
         leaderboard_url = get_leaderboard_url(season, week)
 
@@ -294,6 +481,22 @@ def get_all_season_weeks():
         return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
 
     return sorted(sw_keys, key=sort_key)
+
+def get_latest_season_and_week():
+    weeks = get_all_season_weeks()
+    if not weeks:
+        return None, None
+
+    season_week_map = defaultdict(list)
+    for sw in weeks:
+        season, week = parse_season_week_key(sw)
+        season_week_map[season].append(week)
+
+    latest_season = max(season_week_map.keys())
+    latest_week = max(season_week_map[latest_season])
+
+    return latest_season, latest_week
+
 
 
 
@@ -722,10 +925,10 @@ async def process_past_weeks(channel):
             if sw == latest:
                 continue  # Skip live week
 
-            season = int(sw[1])
-            week = int(sw[3:])
-            leg_urls = build_urls_for_week(season, week)
+            # ✅ Use safe parser instead of slicing sw string
+            season, week = parse_season_week_key(sw)
 
+            leg_urls = build_urls_for_week(season, week)
             for leg, stages in leg_urls.items():
                 for stage, url in stages.items():
                     if not url:
@@ -737,27 +940,31 @@ async def process_past_weeks(channel):
                         await safe_db_call(update_previous_leader, track_name, leaderboard[0]["name"])
                         await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
 
-            # ✅ NEW: log general leaderboard for past week
+            # ✅ Log general leaderboard for past week
             leaderboard_url = get_leaderboard_url(season, week)
             if leaderboard_url:
                 general_leaderboard, soup = scrape_general_leaderboard(leaderboard_url)
                 if general_leaderboard:
                     await safe_db_call(log_general_leaderboard_to_db, season, week, soup)
 
-                        
-
         logging.info("✅ Finished processing past weeks.")
     except Exception as e:
         logging.error(f"Exception in process_past_weeks: {e}")
 
 
+
 async def check_current_week_loop(channel):
-    global CURRENT_SEASON, CURRENT_WEEK
     await bot.wait_until_ready()
 
     while not bot.is_closed():
         try:
-            leg_urls = build_urls_for_week(CURRENT_SEASON, CURRENT_WEEK)
+            season, week = get_latest_season_and_week()
+            if season is None or week is None:
+                logging.warning("⚠️ Could not detect latest season/week.")
+                await asyncio.sleep(60)
+                continue
+
+            leg_urls = build_urls_for_week(season, week)
 
             for leg, stages in leg_urls.items():
                 for stage, url in stages.items():
@@ -767,7 +974,7 @@ async def check_current_week_loop(channel):
                     leaderboard = scrape_leaderboard(url)
                     if leaderboard:
                         current_leader = leaderboard[0]["name"]
-                        track_name = f"S{CURRENT_SEASON}W{CURRENT_WEEK} - Leg {leg} (Stage {stage})"
+                        track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
                         previous_leader = await safe_db_call(get_previous_leader, track_name)
                         if previous_leader is None:
                             continue  # Skip this loop iteration if DB is still down
@@ -789,103 +996,9 @@ async def check_current_week_loop(channel):
                             await channel.send(embed=embed)
 
                         await safe_db_call(update_previous_leader, track_name, current_leader)
-                        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, CURRENT_SEASON, CURRENT_WEEK)
+                        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
 
-            leaderboard_url = get_leaderboard_url(CURRENT_SEASON, CURRENT_WEEK)
-            general_leaderboard, soup = scrape_general_leaderboard(leaderboard_url)
-
-            if general_leaderboard:
-                current_leader = general_leaderboard[0]["name"]
-                track_name = "General Leaderboard"
-                previous_leader = await safe_db_call(get_previous_leader, track_name)
-                if previous_leader is None:
-                    continue  # Skip this loop iteration if DB is still down
-
-                if previous_leader is None:
-                    embed = discord.Embed(
-                        title="📢 General Leader Detected",
-                        description=f"**{current_leader}** is leading **{track_name}**\n(First driver)",
-                        color=discord.Color.blue()
-                    )
-                    await channel.send(embed=embed)
-                elif previous_leader != current_leader:
-                    time_diff = general_leaderboard[1]["diff_first"] if len(general_leaderboard) > 1 else "N/A"
-                    embed = discord.Embed(
-                        title="🏆 New General Leader!",
-                        description=f"**{current_leader}** is now leading **{track_name}**\n(Previously: {previous_leader})\n**Time Diff:** {time_diff}",
-                        color=discord.Color.gold()
-                    )
-                    await channel.send(embed=embed)
-
-                await safe_db_call(update_previous_leader, track_name, current_leader)
-                await safe_db_call(log_general_leaderboard_to_db, CURRENT_SEASON, CURRENT_WEEK, soup)
-
-            await asyncio.sleep(60)
-
-        except Exception as e:
-            logging.error(f"[Loop] Error: {e}")
-            await asyncio.sleep(60)
-
-
-
-
-# Async task to check for leader changes and update DB
-async def check_leader_change():
-    await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
-
-    if not channel:
-        logging.error("Discord channel not found!")
-        return
-
-    while not bot.is_closed():
-        try:
-            # Scrape leg-specific leaderboards
-            for sw in get_all_season_weeks():
-                season = int(sw[1])
-                week = int(sw[3:])
-                leg_urls = build_urls_for_week(season, week)
-
-                for leg, stages in leg_urls.items():
-                    for stage, url in stages.items():
-                        if not url:
-                            continue
-
-                        leaderboard = scrape_leaderboard(url)
-                        if leaderboard:
-                            current_leader = leaderboard[0]["name"]
-                            track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
-                            previous_leader = await safe_db_call(get_previous_leader, track_name)
-                            if previous_leader is None:
-                                continue  # Skip this loop iteration if DB is still down
-
-                            if previous_leader is None:
-                                embed = discord.Embed(
-                                    title="📢 Leader Detected",
-                                    description=f"**{current_leader}** is leading **{track_name}**\n(First driver)",
-                                    color=discord.Color.blue()
-                                )
-                                await channel.send(embed=embed)
-
-                            elif previous_leader != current_leader:
-                                time_diff = leaderboard[1]["diff_first"] if len(leaderboard) > 1 else "N/A"
-                                embed = discord.Embed(
-                                    title="🏆 New Track Leader!",
-                                    description=f"**{current_leader}** is now leading **{track_name}**\n(Previously: {previous_leader})\n**Time Diff:** {time_diff}",
-                                    color=discord.Color.gold()
-                                )
-                                await channel.send(embed=embed)
-
-                            await safe_db_call(update_previous_leader, track_name, current_leader)
-                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
-
-
-            # Scrape general leaderboard
-            latest = get_all_season_weeks()[-1]
-            print("🔍 Season weeks:", get_all_season_weeks())
-            print("🔑 All env_data keys:", list(env_data.keys()))
-            season = int(latest[1])
-            week = int(latest[3:])
+            # 🧠 FIXED: Use current season/week instead of stale globals
             leaderboard_url = get_leaderboard_url(season, week)
             general_leaderboard, soup = scrape_general_leaderboard(leaderboard_url)
 
@@ -913,21 +1026,112 @@ async def check_leader_change():
                     await channel.send(embed=embed)
 
                 await safe_db_call(update_previous_leader, track_name, current_leader)
-                season, week = get_season_week_from_page(LEADERBOARD_URL)
-                scraping_logger.debug(f"[General] Season: {season}, Week: {week} for {LEADERBOARD_URL}")
-
                 await safe_db_call(log_general_leaderboard_to_db, season, week, soup)
+
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            logging.error(f"[Loop] Error: {e}")
+            await asyncio.sleep(60)
+
+
+
+
+
+# Async task to check for leader changes and update DB
+async def check_leader_change():
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CHANNEL_ID)
+
+    if not channel:
+        logging.error("Discord channel not found!")
+        return
+
+    while not bot.is_closed():
+        try:
+            # Scrape leg-specific leaderboards
+            for sw in get_all_season_weeks():
+                try:
+                    season, week = parse_season_week_key(sw)
+                except ValueError as e:
+                    logging.warning(f"Skipping invalid season/week key: {sw} → {e}")
+                    continue
+
+                leg_urls = build_urls_for_week(season, week)
+
+                for leg, stages in leg_urls.items():
+                    for stage, url in stages.items():
+                        if not url:
+                            continue
+
+                        leaderboard = scrape_leaderboard(url)
+                        if leaderboard:
+                            current_leader = leaderboard[0]["name"]
+                            track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
+                            previous_leader = await safe_db_call(get_previous_leader, track_name)
+
+                            if previous_leader is None:
+                                embed = discord.Embed(
+                                    title="📢 Leader Detected",
+                                    description=f"**{current_leader}** is leading **{track_name}**\n(First driver)",
+                                    color=discord.Color.blue()
+                                )
+                                await channel.send(embed=embed)
+                            elif previous_leader != current_leader:
+                                time_diff = leaderboard[1]["diff_first"] if len(leaderboard) > 1 else "N/A"
+                                embed = discord.Embed(
+                                    title="🏆 New Track Leader!",
+                                    description=f"**{current_leader}** is now leading **{track_name}**\n(Previously: {previous_leader})\n**Time Diff:** {time_diff}",
+                                    color=discord.Color.gold()
+                                )
+                                await channel.send(embed=embed)
+
+                            await safe_db_call(update_previous_leader, track_name, current_leader)
+                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
+
+            # Scrape general leaderboard
+            season, week = get_latest_season_and_week()
+            leaderboard_url = get_leaderboard_url(season, week)
+            general_leaderboard, soup = scrape_general_leaderboard(leaderboard_url)
+
+            if general_leaderboard:
+                current_leader = general_leaderboard[0]["name"]
+                track_name = "General Leaderboard"
+                previous_leader = await safe_db_call(get_previous_leader, track_name)
+
+                if previous_leader is None:
+                    embed = discord.Embed(
+                        title="📢 General Leader Detected",
+                        description=f"**{current_leader}** is leading **{track_name}**\n(First driver)",
+                        color=discord.Color.blue()
+                    )
+                    await channel.send(embed=embed)
+                elif previous_leader != current_leader:
+                    time_diff = general_leaderboard[1]["diff_first"] if len(general_leaderboard) > 1 else "N/A"
+                    embed = discord.Embed(
+                        title="🏆 New General Leader!",
+                        description=f"**{current_leader}** is now leading **{track_name}**\n(Previously: {previous_leader})\n**Time Diff:** {time_diff}",
+                        color=discord.Color.gold()
+                    )
+                    await channel.send(embed=embed)
+
+                await safe_db_call(update_previous_leader, track_name, current_leader)
+
+                # ⛏️ Fix here: LEADERBOARD_URL → leaderboard_url
+                season, week = get_season_week_from_page(leaderboard_url)
+                scraping_logger.debug(f"[General] Season: {season}, Week: {week} for {leaderboard_url}")
+                await safe_db_call(log_leaderboard_to_db, track_name, general_leaderboard, season, week)
 
                 scraping_logger.info(f"✅ Logged general leaderboard for S{season if season else 'None'}W{week if week else 'None'}")
 
             await asyncio.sleep(60)
 
-            import traceback
-
         except Exception as e:
+            import traceback
             error_msg = f"Exception in check_leader_change:\n{traceback.format_exc()}"
             logging.error(error_msg)
             await channel.send("⚠️ An error occurred while checking leaderboards.")
+
 
 
 @bot.event
@@ -937,21 +1141,17 @@ async def on_ready():
 
     await process_past_weeks(channel)
 
-    # 🔍 ADD THIS DEBUG BLOCK
+    # 🔍 Debug output
     weeks = get_all_season_weeks()
     print("📋 Season/Week keys found:", weeks)
 
     if not weeks:
         print("⚠️ No season/week keys found! env_data keys are:", list(env_data.keys()))
-        return  # ✅ Optional: Prevent crash if list is empty
+        return  # Optional: prevent crash if list is empty
 
-    # 🧨 This was crashing if the list was empty
-    latest = weeks[-1]
-    global CURRENT_SEASON, CURRENT_WEEK
-    CURRENT_SEASON = int(latest[1])
-    CURRENT_WEEK = int(latest[3:])
-
+    # ✅ Start the loop task — now dynamic, no need for CURRENT_SEASON/WEEK
     bot.loop.create_task(check_current_week_loop(channel))
+
 
 
 # ---- Command Handlers ----
@@ -982,9 +1182,7 @@ async def handle_leg_command(message):
         if not all_weeks:
             await message.channel.send("❌ No rally data available.")
             return
-        latest = all_weeks[-1]
-        season = int(latest[1])
-        week = int(latest[3:])
+        season, week = get_latest_season_and_week()
 
     try:
         urls_by_leg = build_urls_for_week(season, week)
@@ -1146,9 +1344,7 @@ async def handle_leaderboard_command(message):
             if not all_weeks:
                 await message.channel.send("❌ No season/week data found.")
                 return
-            latest = all_weeks[-1]
-            season = int(latest[1])
-            week = int(latest[3:])
+            season, week = get_latest_season_and_week()
 
         leaderboard_url = get_leaderboard_url(season, week)
         if not leaderboard_url:
@@ -1175,6 +1371,29 @@ async def handle_leaderboard_command(message):
 
     except Exception as e:
         await message.channel.send(f"❌ An error occurred: {e}")
+
+
+async def handle_info_command(message):
+    info_url = os.getenv("INFO_URL")
+    rally_name = os.getenv("RALLY_NAME")
+    rally_password = os.getenv("RALLY_PASSWORD")
+    league_name = os.getenv("LEAGUE_NAME", "Rally Info")  # fallback if not set
+
+    if not info_url or not rally_name or not rally_password:
+        await message.channel.send("⚠️ Missing one or more values in your `.env` file. Please check `INFO_URL`, `RALLY_NAME`, and `RALLY_PASSWORD`.")
+        return
+
+    embed = discord.Embed(
+        title=f"ℹ️ {league_name}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="🔗 Link To Page", value=f"[Click Here]({info_url})", inline=False)
+    embed.add_field(name="🏁 Championship Name", value=rally_name, inline=False)
+    embed.add_field(name="🔒 Password", value=rally_password, inline=False)
+
+    await message.channel.send(embed=embed)
+
+
 
 
 async def handle_cmd_command(message):
@@ -1222,15 +1441,10 @@ async def on_message(message):
         await handle_search_command(message)
     elif message.content.startswith("!cmd"):
         await handle_cmd_command(message)
+    elif message.content.startswith("!sync"):
+        await handle_sync_command(message)
     elif message.content.startswith("!info"):
-        if INFO_URL and RALLY_NAME and RALLY_PASSWORD:
-            await message.channel.send(
-                f"**Here is the link:** {INFO_URL}\n"
-                f"**Rally Championship Name:** {RALLY_NAME}\n"
-                f"**Password:** {RALLY_PASSWORD}"
-            )
-        else:
-            await message.channel.send("Error: Some information is missing in the `.env` file.")
+        await handle_info_command(message)
     elif message.content.startswith("!points"):
         file_path = os.path.join(os.path.dirname(__file__), "standings.csv")
         if not os.path.exists(file_path):
