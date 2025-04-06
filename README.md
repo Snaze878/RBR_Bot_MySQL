@@ -1,4 +1,4 @@
-# 🏁 RBR Discord Bot (MySQL Edition)
+# 🌟 RBR Discord Bot (MySQL Edition)
 
 Welcome to the **RBR Discord Bot (MySQL Edition)**!  
 This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans.hu/) and posts real-time updates to Discord, enhanced with **MySQL database** integration. Designed for rally communities who want historical tracking, leader change announcements, and interactive search features. This is the more complex version of https://github.com/Snaze878/RBR-Bot
@@ -18,6 +18,9 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 
 - **Interactive Dropdowns**  
   Driver and week selection via Discord UI elements.
+
+- **Google Sheets Integration**  
+  Dynamically syncs new rally weeks and configuration from a form submission.
 
 - **Advanced Commands**  
   Search drivers, compare results, or filter by season/week.
@@ -40,6 +43,7 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 !points                       → Show CSV-based driver points
 !info                         → Rally name, password, and info URL
 !cmd                          → List available commands
+!sync                         → Pull new config & data from Google Sheets
 ```
 
 ---
@@ -49,11 +53,12 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 - **Scraping:** Uses `requests`, `selenium`, and `BeautifulSoup` to gather leaderboard data.
 - **Storage:** Logs results to MySQL (`leaderboard_log`, `general_leaderboard_log`, `previous_leaders`).
 - **Discord Integration:** `discord.py` with rich embeds and dropdown menus.
-- **Dynamic Week/Season Handling:** URLs and settings pulled from `.env`.
+- **Dynamic Week/Season Handling:** URLs and settings pulled from `.env` and synced via Google Sheets.
+- **Data Retry:** All DB operations retry if MySQL is temporarily down.
 
 ---
 
-## 📅 Installation Guide
+## 🗓️ Installation Guide
 
 ### 1. Install Python
 
@@ -86,13 +91,11 @@ pip install -r requirements.txt
   - Read Message History
   - Use External Emojis
 
-- Use OAuth2 Generator (Bot scope, required permissions) to invite the bot to your server.
+Use the OAuth2 URL Generator to get an invite link and add the bot to your server.
 
 ---
 
 ### 5. Configure `.env`
-
-Edit the `.env` file with your values:
 
 ```env
 DISCORD_BOT_TOKEN=your_token
@@ -114,11 +117,38 @@ S1W1_LEG_1_1=https://example.com
 
 ---
 
-### 6. Create the MySQL Database
+### 6. Google Sheets Integration
+
+This allows you to dynamically manage rally config + update `.env` and `standings.csv` with a Google Form.
+
+#### a. Create Google Sheet
+1. Create a new sheet called **`BWRL_RBR`**.
+2. Sheet1 should collect rally details:
+   - Season Number
+   - Week Number
+   - Leaderboard URL
+   - New Rally Name (optional)
+   - LEG 1 STAGE 1 URL, LEG 1 STAGE 2 URL, ...
+
+#### b. Set Up Service Account
+1. Visit [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a project and enable **Google Sheets API** & **Google Drive API**.
+3. Create a **Service Account**, download its JSON credentials.
+4. Rename the file to `google_creds.json` and place it in your bot directory.
+5. Share your Google Sheet with the service account email.
+
+#### c. Run the Sync
+```bash
+!sync
+```
+This will update `.env` and download standings into `standings.csv`.
+
+---
+
+### 7. MySQL Database Setup
 
 ```sql
 CREATE DATABASE rbr_leaderboards CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
 USE rbr_leaderboards;
 
 CREATE TABLE leaderboard_log (
@@ -157,31 +187,32 @@ CREATE TABLE general_leaderboard_log (
 
 ---
 
-### 7. Enable Developer Mode in Discord
+### 8. Enable Developer Mode in Discord
 
 - Go to **User Settings > Advanced > Developer Mode**.
 - Right-click a channel → **Copy Channel ID** → paste it into `.env`.
 
 ---
 
-### 8. Run the Bot
+### 9. Run the Bot
 
 ```bash
 python RBR_Bot.py
 ```
 
-You’re all set! The bot will scrape and post updates in your configured channel.
+The bot will initialize past week scraping, post to Discord, and begin watching for updates.
 
 ---
 
 ## 📃 File Structure
 
 ```
-📁 your_repo/
+🔍 your_repo/
 🔹 RBR_Bot.py           # Main bot logic
 🔹 requirements.txt     # Dependencies
-🔹 .env                 # Bot + DB + URL config
-🔹 standings.csv        # Season standings
+🔹 .env                 # Config from Discord/MySQL/Google
+🔹 standings.csv        # Auto-updated season standings
+🔹 google_creds.json    # Service account credentials
 🔹 logs/                # Daily logs (commands, scraping, errors)
 ```
 
@@ -200,4 +231,3 @@ Join the support community here:
 
 This project is open-source and licensed under the **GNU General Public License v3**.  
 Feel free to modify and distribute it under the terms of the license.
-
