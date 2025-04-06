@@ -6,3 +6,5 @@ beautifulsoup4
 selenium
 webdriver-manager
 cryptography
+gspread
+oauth2client
