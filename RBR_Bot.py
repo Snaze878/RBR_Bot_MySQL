@@ -105,8 +105,8 @@ def sync_from_google_sheet():
         creds = ServiceAccountCredentials.from_json_keyfile_name("google_creds.json", scope)
         client = gspread.authorize(creds)
 
-        # Open the BWRL_RBR spreadsheet
-        spreadsheet = client.open("BWRL_RBR")
+        # Open the RBR_Tracking spreadsheet
+        spreadsheet = client.open("RBR_Tracking")
 
         # === Get Latest Rally Config from Form Sheet ===
         form_sheet = spreadsheet.sheet1
