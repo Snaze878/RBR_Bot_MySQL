@@ -1,0 +1,8 @@
+discord.py
+aiomysql
+python-dotenv
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+cryptography
