@@ -122,7 +122,7 @@ S1W1_LEG_1_1=https://example.com
 This allows you to dynamically manage rally config + update `.env` and `standings.csv` with a Google Form.
 
 #### a. Create Google Sheet
-1. Create a new sheet called **`BWRL_RBR`**.
+1. Create a new sheet called **`RBR_Tracking`**.
 2. Sheet1 should collect rally details:
    - Season Number
    - Week Number
