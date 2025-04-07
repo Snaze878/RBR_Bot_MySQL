@@ -195,9 +195,9 @@ def sync_from_google_sheet():
 # Syncing with Google Handler
 # Replace this with your actual Discord ID(s)
 ALLOWED_SYNC_USERS = [
-    111111111111111111,  # User 1
-    222222222222222222,  # User 2
-    133333333333333333   # User 3
+    186925192486977536,  # Garreth
+    542759149021167617,  # Jacob
+    163574427727036416   # Chris
 ]
 
 async def handle_sync_command(message):
@@ -285,6 +285,181 @@ async def handle_sync_command(message):
 
 # (Rest of the code continues, properly cleaned up...)
 
+async def get_driver_stats(driver_name):
+    try:
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # Total entries
+            await cursor.execute("""
+                SELECT COUNT(*) as total_events FROM leaderboard_log
+                WHERE LOWER(driver_name) LIKE %s
+            """, (f"%{driver_name}%",))
+            total_events = (await cursor.fetchone())["total_events"]
+
+            # Average position
+            await cursor.execute("""
+                SELECT AVG(position) as avg_position FROM leaderboard_log
+                WHERE LOWER(driver_name) LIKE %s
+            """, (f"%{driver_name}%",))
+            avg_position = (await cursor.fetchone())["avg_position"]
+
+            # Best finish
+            await cursor.execute("""
+                SELECT position, track_name FROM leaderboard_log
+                WHERE LOWER(driver_name) LIKE %s
+                ORDER BY position ASC LIMIT 1
+            """, (f"%{driver_name}%",))
+            best_row = await cursor.fetchone()
+            best_finish = f"{best_row['position']}th in {best_row['track_name']}" if best_row else "N/A"
+
+            # Podiums
+            await cursor.execute("""
+                SELECT COUNT(*) as podiums FROM leaderboard_log
+                WHERE driver_name LIKE %s AND position <= 3
+            """, (f"%{driver_name}%",))
+            podiums = (await cursor.fetchone())["podiums"]
+
+            # Wins
+            await cursor.execute("""
+                SELECT COUNT(*) as wins FROM leaderboard_log
+                WHERE driver_name LIKE %s AND position = 1
+            """, (f"%{driver_name}%",))
+            wins = (await cursor.fetchone())["wins"]
+
+            # Most used vehicle
+            await cursor.execute("""
+                SELECT vehicle, COUNT(*) as count FROM leaderboard_log
+                WHERE driver_name LIKE %s AND vehicle IS NOT NULL AND vehicle != ''
+                GROUP BY vehicle ORDER BY count DESC LIMIT 1
+            """, (f"%{driver_name}%",))
+            vehicle_row = await cursor.fetchone()
+            most_vehicle = vehicle_row["vehicle"] if vehicle_row else "Unknown"
+
+        conn.close()
+
+        # Read from standings.csv for total points
+        points = "N/A"
+        standings_path = os.path.join(os.path.dirname(__file__), "standings.csv")
+        try:
+            with open(standings_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if driver_name.lower() in row["Driver"].lower():
+                        points = row["Points"]
+                        break
+        except Exception as e:
+            logging.warning(f"Could not read standings.csv: {e}")
+
+        embed = discord.Embed(
+            title=f"📊 Stats for {driver_name}",
+            color=discord.Color.teal()
+        )
+        embed.add_field(name="🎯 Total Events", value=total_events, inline=True)
+        embed.add_field(name="📈 Avg Position", value=f"{avg_position:.2f}" if avg_position else "N/A", inline=True)
+        embed.add_field(name="🏆 Best Finish", value=best_finish, inline=False)
+        embed.add_field(name="🥇 Wins", value=wins, inline=True)
+        embed.add_field(name="🥉 Podiums", value=podiums, inline=True)
+        embed.add_field(name="🏎️ Most Used Car", value=most_vehicle, inline=False)
+        embed.add_field(name="🏁 Points", value=f"{points} pts", inline=False)
+
+        return embed
+
+    except Exception as e:
+        logging.error(f"[ERROR] get_driver_stats failed: {e}")
+        return None
+
+
+async def get_driver_trend(driver_name):
+    try:
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            driver_name_lower = driver_name.lower()
+            all_weeks = get_all_season_weeks()
+            if not all_weeks:
+                return None
+
+            trend_data = []
+            previous_position = None
+
+            for sw in all_weeks:
+                try:
+                    season, week = parse_season_week_key(sw)
+                except ValueError:
+                    continue
+
+                await cursor.execute("""
+                    SELECT position, diff_first, time
+                    FROM general_leaderboard_log
+                    WHERE LOWER(driver_name) LIKE %s AND season = %s AND week = %s
+                    ORDER BY position ASC
+                    LIMIT 1
+                """, (f"%{driver_name_lower}%", season, week))
+
+                result = await cursor.fetchone()
+
+                label = f"S{season}W{week}"
+
+                if result:
+                    pos = result['position']
+                    gap = result['diff_first']
+                    time_total = result['time']
+
+                    # Icons for position
+                    if pos == 1:
+                        icon = "🥇"
+                    elif pos == 2:
+                        icon = "🥈"
+                    elif pos == 3:
+                        icon = "🥉"
+                    else:
+                        icon = ""
+
+                    # Arrow based on movement
+                    if previous_position is not None:
+                        if pos < previous_position:
+                            trend = "⬆️"
+                        elif pos > previous_position:
+                            trend = "⬇️"
+                        else:
+                            trend = "➡️"
+                    else:
+                        trend = ""
+
+                    previous_position = pos
+
+                    line = f"{icon} Pos: {pos} {trend}\n⏱️ {time_total}\nGap: {gap}"
+                else:
+                    line = "❌ Did not participate"
+                    previous_position = None  # Reset for skipped week
+
+                trend_data.append((label, line))
+
+        conn.close()
+
+        embed = discord.Embed(
+            title=f"📈 Trend for {driver_name}",
+            description="Weekly performance breakdown",
+            color=discord.Color.orange()
+        )
+
+        for label, line in trend_data:
+            embed.add_field(name=label, value=line, inline=False)
+
+        return embed
+
+    except Exception as e:
+        logging.error(f"[ERROR] get_driver_trend failed: {e}")
+        return None
+
+
+
+
+def get_position_suffix(position):
+    if 11 <= position % 100 <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(position % 10, "th")
+
+
 
 async def search_driver(driver_name):
     try:
@@ -293,7 +468,7 @@ async def search_driver(driver_name):
             query = """
                 SELECT track_name, position, driver_name, vehicle, time, diff_first, scraped_at
                 FROM leaderboard_log
-                WHERE driver_name LIKE %s
+                WHERE LOWER(driver_name) LIKE %s
                 ORDER BY scraped_at DESC
                 LIMIT 10
             """
@@ -525,14 +700,14 @@ async def log_general_leaderboard_to_db(season, week, soup):
 
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) >= 6:
+            if len(cols) >= 7:  # changed from 6 to 7 due to extra column
                 try:
                     position = int(cols[0].text.strip())
                     driver_name = cols[1].text.strip()
-                    vehicle = cols[2].text.strip()
-                    time = cols[3].text.strip()
-                    diff_prev = cols[4].text.strip()
-                    diff_first = cols[5].text.strip()
+                    vehicle = cols[3].text.strip()       # fixed index
+                    time = cols[4].text.strip()
+                    diff_prev = cols[5].text.strip()
+                    diff_first = cols[6].text.strip()
 
                     await cursor.execute("""
                         INSERT INTO general_leaderboard_log 
@@ -543,6 +718,7 @@ async def log_general_leaderboard_to_db(season, week, soup):
                     scraping_logger.error(f"⚠️ Failed to insert row: {e}")
     conn.close()
     scraping_logger.info(f"✅ Replaced general leaderboard entries for S{season}W{week}")
+
 
 
 
@@ -613,7 +789,7 @@ class DriverSelect(discord.ui.Select):
         super().__init__(placeholder="Select a driver", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        selected_driver = self.values[0]
+        selected_driver = self.values[0].strip()
         await interaction.response.defer(ephemeral=False)
 
         # Disable this dropdown
@@ -641,10 +817,117 @@ class DriverSelect(discord.ui.Select):
                 pass
 
 
+class StatsDriverSelect(discord.ui.Select):
+    def __init__(self, driver_names):
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in sorted(driver_names)[:25]
+        ]
+        super().__init__(placeholder="Select a driver", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_driver = self.values[0].strip()
+        await interaction.response.defer(ephemeral=False)
+
+        # Disable the dropdown
+        for child in self.view.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self.view)
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to disable StatsDriverSelect dropdown: {e}")
+
+        # Fetch stats
+        embed = await get_driver_stats(selected_driver)
+        if embed:
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("❌ Failed to fetch stats.")
+
+class HistoryDriverSelect(discord.ui.Select):
+    def __init__(self, driver_names):
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in sorted(driver_names)[:25]
+        ]
+        super().__init__(placeholder="Select a driver", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_label = self.values[0].strip()
+        await interaction.response.defer(ephemeral=False)
+
+        # Disable dropdown
+        for child in self.view.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self.view)
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to disable dropdown: {e}")
+
+        # Extract usable driver name
+        name_parts = [p.strip() for p in selected_label.split("/") if p.strip()]
+        query_name = name_parts[-1] if name_parts else selected_label  # fallback
+
+        embed = await get_driver_history(query_name)
+        if embed:
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("❌ Could not fetch driver history.")
+
+
+
+class HistoryDriverSearchView(discord.ui.View):
+    def __init__(self, driver_names):
+        super().__init__(timeout=60)
+        self.add_item(HistoryDriverSelect(driver_names))
+
+
+class TrendDriverSelect(discord.ui.Select):
+    def __init__(self, driver_names):
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in sorted(driver_names)[:25]
+        ]
+        super().__init__(placeholder="Select a driver to view trend", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_label = self.values[0].strip()
+        await interaction.response.defer()
+
+        for child in self.view.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self.view)
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to disable dropdown: {e}")
+
+        # Extract usable search name (e.g., drop prefix/team name if present)
+        name_parts = [p.strip() for p in selected_label.split("/") if p.strip()]
+        query_name = name_parts[-1] if name_parts else selected_label
+
+        embed = await get_driver_trend(query_name)
+        if embed:
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("⚠️ No trend data found.")
+
+
+class TrendDriverSearchView(discord.ui.View):
+    def __init__(self, driver_names):
+        super().__init__(timeout=60)
+        self.add_item(TrendDriverSelect(driver_names))
+
+
 class DriverSearchView(discord.ui.View):
     def __init__(self, driver_names):
         super().__init__(timeout=60)
         self.add_item(DriverSelect(driver_names))  # This now points to the second DriverSelect
+
+class StatsDriverSearchView(discord.ui.View):
+    def __init__(self, driver_names):
+        super().__init__(timeout=60)
+        self.add_item(StatsDriverSelect(driver_names))
+
 
 
 class SeasonWeekSelect(discord.ui.Select):
@@ -712,44 +995,46 @@ def scrape_general_leaderboard(url, table_class="rally_results"):
         return [], None
 
     soup = BeautifulSoup(response.text, "html.parser")
-    leaderboard = []
     tables = soup.find_all("table", {"class": table_class})
 
     if not tables:
         scraping_logger.warning(f"Table not found for {url}!")
         return [], soup
 
-    # Use the first table with data rows
-    table = None
-    for t in tables:
-        if len(t.find_all("tr")) > 1:
-            table = t
+    leaderboard = []
+
+    # Find the correct table with enough rows (skip headers etc.)
+    for t_index, t in enumerate(tables):
+        rows = t.find_all("tr")
+        if len(rows) < 2:
+            continue
+
+        for i, row in enumerate(rows):
+            cols = row.find_all("td")
+            if not cols:
+                continue  # Skip header rows
+
+            # Adjust this to match actual layout of the website
+            if len(cols) >= 8:
+                entry = {
+                    "position": cols[0].text.strip(),
+                    "name": cols[1].text.strip(),
+                    # Skip cols[2] — unknown/unneeded
+                    "vehicle": cols[3].text.strip(),
+                    "time": cols[4].text.strip(),
+                    "diff_prev": cols[5].text.strip(),
+                    "diff_first": cols[6].text.strip()
+                }
+                leaderboard.append(entry)
+                #print(f"✅ Added entry: {entry}")
+
+        # Only use the first valid table
+        if leaderboard:
             break
 
-    if not table:
-        scraping_logger.warning(f"No valid table with data found for {url}!")
-        return [], soup
-
-    table_rows = table.find_all("tr")
-    scraping_logger.info(f"Found {len(table_rows)} rows for {url}")
-
-    for index, row in enumerate(table_rows[0:]):
-        columns = row.find_all("td")
-        if len(columns) >= 7:
-            entry = {
-                "position": columns[0].text.strip(),
-                "name": columns[1].text.strip(),
-                "vehicle": columns[3].text.strip(),
-                "time": columns[4].text.strip(),
-                "diff_prev": columns[5].text.strip(),
-                "diff_first": columns[6].text.strip()
-            }
-            leaderboard.append(entry)
-            scraping_logger.debug(f"Row {index + 1} - Added: {entry} from {url}")
-
-    # Logging moved to check_leader_change, so no need here
-    scraping_logger.info(f"Final leaderboard ({len(leaderboard)} entries) for {url}")
+    scraping_logger.info(f"✅ Final leaderboard ({len(leaderboard)} entries) for {url}")
     return leaderboard, soup
+
 
 def get_season_week_from_page(url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -950,6 +1235,56 @@ async def process_past_weeks(channel):
         logging.info("✅ Finished processing past weeks.")
     except Exception as e:
         logging.error(f"Exception in process_past_weeks: {e}")
+
+async def get_driver_history(driver_name):
+    try:
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            driver_name_lower = driver_name.lower()
+
+            await cursor.execute("""
+                SELECT season, week, position, diff_first
+                FROM general_leaderboard_log
+                WHERE LOWER(driver_name) LIKE %s
+                ORDER BY season ASC, week ASC
+            """, (f"%{driver_name_lower}%",))
+
+            results = await cursor.fetchall()
+
+        conn.close()
+
+        # Build a lookup for (season, week) to result
+        result_lookup = {(row['season'], row['week']): row for row in results}
+
+        all_weeks = get_all_season_weeks()
+        if not all_weeks:
+            return None
+
+        history_lines = []
+        for sw in all_weeks:
+            try:
+                season, week = parse_season_week_key(sw)
+            except ValueError:
+                continue
+
+            data = result_lookup.get((season, week))
+            if data:
+                history_lines.append(f"S{season}W{week} — Pos: {data['position']} ⏳ ({data['diff_first']})")
+            else:
+                history_lines.append(f"S{season}W{week} — ❌ Did not participate")
+
+        embed = discord.Embed(
+            title=f"📜 History for {driver_name}",
+            description="\n".join(history_lines),
+            color=discord.Color.blurple()
+        )
+
+        return embed
+
+    except Exception as e:
+        logging.error(f"[ERROR] get_driver_history failed: {e}")
+        return None
+
 
 
 
@@ -1156,6 +1491,33 @@ async def on_ready():
 
 # ---- Command Handlers ----
 
+async def handle_history_command(message):
+    parts = message.content.strip().split()
+
+    if len(parts) < 2:
+        # Show dropdown for driver selection
+        conn = await get_db_connection()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT DISTINCT driver_name FROM leaderboard_log ORDER BY driver_name ASC LIMIT 25")
+            result = await cursor.fetchall()
+        conn.close()
+
+        if not result:
+            await message.channel.send("⚠️ No driver names found.")
+            return
+
+        names = [row[0] for row in result]
+        await message.channel.send("📜 Select a driver to view history:", view=HistoryDriverSearchView(names))
+        return
+
+    query_name = " ".join(parts[1:])
+    embed = await get_driver_history(query_name)
+    if embed:
+        await message.channel.send(embed=embed)
+    else:
+        await message.channel.send("❌ Could not retrieve history.")
+
+
 async def handle_leg_command(message):
     parts = message.content.strip().split()
 
@@ -1229,6 +1591,31 @@ async def handle_leg_command(message):
     except Exception as e:
         await message.channel.send(f"❌ An error occurred while processing Leg {leg_number}: {e}")
 
+async def handle_trend_command(message):
+    parts = message.content.strip().split()
+
+    if len(parts) < 2:
+        conn = await get_db_connection()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT DISTINCT driver_name FROM general_leaderboard_log ORDER BY driver_name ASC LIMIT 25")
+            result = await cursor.fetchall()
+        conn.close()
+
+        if not result:
+            await message.channel.send("⚠️ No driver names found.")
+            return
+
+        names = [row[0] for row in result]
+        await message.channel.send("📉 Select a driver to view trend:", view=TrendDriverSearchView(names))
+    else:
+        query_name = " ".join(parts[1:])
+        embed = await get_driver_trend(query_name)
+        if embed:
+            await message.channel.send(embed=embed)
+        else:
+            await message.channel.send("⚠️ No trend data found for that driver.")
+
+
 
 async def handle_search_command(message):
     parts = message.content.strip().split()
@@ -1269,6 +1656,35 @@ async def handle_search_command(message):
     except Exception as e:
         logging.error(f"[ERROR] search driver failed: {e}")
         await message.channel.send("❌ An error occurred while searching for the driver.")
+
+
+async def handle_stats_command(message):
+    parts = message.content.strip().split()
+
+    if len(parts) < 2:
+        # Show dropdown specific to stats
+        conn = await get_db_connection()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT DISTINCT driver_name FROM leaderboard_log ORDER BY driver_name ASC LIMIT 25")
+            result = await cursor.fetchall()
+        conn.close()
+
+        if not result:
+            await message.channel.send("⚠️ No driver names found.")
+            return
+
+        names = [row[0] for row in result]
+        await message.channel.send("📊 Select a driver to view stats:", view=StatsDriverSearchView(names))
+
+    else:
+        query_name = " ".join(parts[1:])
+        embed = await get_driver_stats(query_name)
+        if embed:
+            await message.channel.send(embed=embed)
+        else:
+            await message.channel.send("❌ Could not retrieve stats.")
+
+
 
 
 async def handle_compare_command(message):
@@ -1398,32 +1814,46 @@ async def handle_info_command(message):
 
 async def handle_cmd_command(message):
     commands_list = """
-**📋 Available Commands:**
+**📋 Available Commands:**  
 
 🔍 `!search [driver] [s#w#]`  
 → Opens a driver dropdown if no name is provided  
 → You can skip the season/week (like `!search trey`) and it’ll use the current one  
 
+📊 `!stats [driver]`  
+→ View a driver’s total events, avg position, best finish, wins, podiums, most used car, and points  
+→ Use with dropdown or a name (e.g. `!stats Trey`)  
+
+📜 `!history [driver]`  
+→ Shows general leaderboard history per week with position and gap  
+→ Use with dropdown or a name (e.g. `!history Garreth`)  
+
+📈 `!trend [driver]`  
+→ See weekly trends with icons, movement arrows, and total time/gap  
+→ Use with dropdown or a name (e.g. `!trend Chris`)  
+
 🏁 `!leaderboard [s#w#]`  
 → Shows the general leaderboard for the specified or current week  
 
 🧭 `!leg# [s#w#]`  
-→ Shows leg results, e.g. `!leg2 s1w3` or just `!leg2` for current week  
+→ Shows leg results, e.g. `!leg2 s2w3` or just `!leg2` for current week  
 
-📊 `!compare driver1 driver2`  
-→ Compare two drivers over all weeks  
+⚔️ `!compare driver1 vs driver2`  
+→ Compare two drivers head-to-head across shared events  
 
-📈 `!points`  
+🎯 `!points`  
 → View full standings from `standings.csv`  
 
 ℹ️ `!info`  
 → Rally info pulled from `.env`  
 
+🔄 `!sync`  
+→ Admins only: syncs latest config + standings from Google Sheets  
+
 🧪 `!cmd`  
 → Shows this list of commands
     """
     await message.channel.send(commands_list)
-
 
 
 @bot.event
@@ -1443,8 +1873,14 @@ async def on_message(message):
         await handle_cmd_command(message)
     elif message.content.startswith("!sync"):
         await handle_sync_command(message)
+    elif message.content.startswith("!stats"):
+        await handle_stats_command(message)
     elif message.content.startswith("!info"):
         await handle_info_command(message)
+    elif message.content.startswith("!trend"):
+        await handle_trend_command(message)
+    elif message.content.startswith("!history"):
+        await handle_history_command(message)
     elif message.content.startswith("!points"):
         file_path = os.path.join(os.path.dirname(__file__), "standings.csv")
         if not os.path.exists(file_path):
