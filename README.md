@@ -26,13 +26,16 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
   Search drivers, compare results, or filter by season/week.
 
 - **New: Driver Stats, Trends & History**  
-  Track individual driver performance, podiums, and weekly progression.
+  Track individual driver performance, podiums, weekly progression, and vehicle usage.
 
 - **Archived Data Support**  
   Past results are cached and accessible via commands.
 
 - **CSV-Based Standings**  
   Reads from `standings.csv` to show season-long point totals.
+
+- **Two Leaderboard Tables**  
+  Now logs both LEFT and RIGHT table data from the rallysimfans website.
 
 ---
 
@@ -50,6 +53,7 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 !info                         → Rally name, password, and info URL
 !sync                         → Pull new config & data from Google Sheets
 !cmd                          → List available commands
+!skillissue                   → Shows who finished last this week with a motivational quote
 ```
 
 > 🧠 You can also run `!stats`, `!history`, `!search`, or `!trend` without any driver name to open a dropdown menu.
@@ -59,10 +63,11 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 ## ⚙️ How It Works
 
 - **Scraping:** Uses `requests`, `selenium`, and `BeautifulSoup` to gather leaderboard data.
-- **Storage:** Logs results to MySQL (`leaderboard_log`, `general_leaderboard_log`, `previous_leaders`).
+- **Storage:** Logs results to MySQL (`leaderboard_log`, `leaderboard_log_left`, `general_leaderboard_log`, `previous_leaders`).
 - **Discord Integration:** `discord.py` with rich embeds and dropdown menus.
 - **Dynamic Week/Season Handling:** URLs and settings pulled from `.env` and synced via Google Sheets.
 - **Data Retry:** All DB operations retry if MySQL is temporarily down.
+- **Leader Change Loop:** Bot constantly monitors for leader changes in all active rally stages.
 
 ---
 
@@ -127,7 +132,7 @@ S1W1_LEG_1_1=https://example.com
 
 ### 6. Google Sheets Integration
 
-This allows you to dynamically manage rally config + update `.env` and `standings.csv` with a Google Form.
+Allows you to dynamically manage rally config + update `.env` and `standings.csv` with a Google Form.
 
 #### a. Create Google Sheet
 1. Create a new sheet called **`RBR_Tracking`**.
@@ -173,10 +178,18 @@ CREATE TABLE leaderboard_log (
     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE previous_leaders (
-    track_name VARCHAR(255) PRIMARY KEY,
-    leader_name VARCHAR(255),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+CREATE TABLE leaderboard_log_left (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    track_name VARCHAR(255),
+    position INT,
+    driver_name VARCHAR(255),
+    vehicle VARCHAR(255),
+    time VARCHAR(50),
+    diff_prev VARCHAR(50),
+    diff_first VARCHAR(50),
+    season INT,
+    week INT,
+    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE general_leaderboard_log (
@@ -190,6 +203,12 @@ CREATE TABLE general_leaderboard_log (
     season INT,
     week INT,
     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE previous_leaders (
+    track_name VARCHAR(255) PRIMARY KEY,
+    leader_name VARCHAR(255),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 ```
 
