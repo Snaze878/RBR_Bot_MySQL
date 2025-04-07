@@ -195,9 +195,9 @@ def sync_from_google_sheet():
 # Syncing with Google Handler
 # Replace this with your actual Discord ID(s)
 ALLOWED_SYNC_USERS = [
-    186925192486977536,  # Garreth
-    542759149021167617,  # Jacob
-    163574427727036416   # Chris
+    111111111111111111,  # User 1
+    222222222222222222,  # User 2
+    333333333333333333   # User 3
 ]
 
 async def handle_sync_command(message):
@@ -1860,7 +1860,11 @@ async def handle_cmd_command(message):
 async def on_message(message):
     if message.author == bot.user:
         return
-
+        # ✅ Only allow commands from a specific channel
+        allowed_channel_id = 1348069119685296220  # 🔁 Replace this with your actual channel ID
+        if message.channel.id != allowed_channel_id:
+            return
+    
     if message.content.startswith("!compare"):
         await handle_compare_command(message)
     elif message.content.startswith("!leaderboard"):
