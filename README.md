@@ -25,6 +25,9 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 - **Advanced Commands**  
   Search drivers, compare results, or filter by season/week.
 
+- **New: Driver Stats, Trends & History**  
+  Track individual driver performance, podiums, and weekly progression.
+
 - **Archived Data Support**  
   Past results are cached and accessible via commands.
 
@@ -37,14 +40,19 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 
 ```
 !search [driver] [s#w#]       → Search for a driver's results (dropdown if blank)
+!stats [driver]               → View driver's stats: total events, avg pos, wins, podiums, vehicle, points
+!history [driver]             → View week-by-week positions & gaps on general leaderboard
+!trend [driver]               → See performance trend: arrows, medals, time gaps per week
 !leaderboard [s#w#]           → Show general leaderboard
 !leg1 to !leg6 [s#w#]         → Display top 5 per stage in a rally leg
 !compare driver1 vs driver2   → Head-to-head comparison
 !points                       → Show CSV-based driver points
 !info                         → Rally name, password, and info URL
-!cmd                          → List available commands
 !sync                         → Pull new config & data from Google Sheets
+!cmd                          → List available commands
 ```
+
+> 🧠 You can also run `!stats`, `!history`, `!search`, or `!trend` without any driver name to open a dropdown menu.
 
 ---
 
