@@ -1,6 +1,7 @@
 import discord
 import asyncio
 import requests
+import random
 import time
 import csv
 import logging
@@ -197,7 +198,7 @@ def sync_from_google_sheet():
 ALLOWED_SYNC_USERS = [
     111111111111111111,  # User 1
     222222222222222222,  # User 2
-    333333333333333333   # User 3
+    333333333333333333  # User 3
 ]
 
 async def handle_sync_command(message):
@@ -239,7 +240,8 @@ async def handle_sync_command(message):
                         if leaderboard:
                             track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
                             await safe_db_call(update_previous_leader, track_name, leaderboard[0]["name"])
-                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
+                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week, url)
+
                             scraped_tracks += 1
                         else:
                             failed_tracks += 1
@@ -253,6 +255,17 @@ async def handle_sync_command(message):
                     summary_lines.append(f"📊 General leaderboard scraped and logged.")
                 else:
                     summary_lines.append(f"⚠️ Failed to scrape general leaderboard.")
+
+                # ⬇️ ADD THIS
+
+                left_leaderboard = scrape_left_leaderboard(leaderboard_url)
+                if left_leaderboard:
+                    await safe_db_call(log_left_leaderboard_to_db, "General Leaderboard Left", left_leaderboard, season, week)
+                    summary_lines.append("📊 LEFT leaderboard scraped and logged.")
+                else:
+                    summary_lines.append("⚠️ Failed to scrape LEFT leaderboard.")
+
+
 
             summary_lines.append(f"📈 Leg stages scraped: {scraped_tracks}")
             if failed_tracks:
@@ -289,55 +302,70 @@ async def get_driver_stats(driver_name):
     try:
         conn = await get_db_connection()
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            # Total entries
+            # Total events (exclude 9999 position)
             await cursor.execute("""
-                SELECT COUNT(*) as total_events FROM leaderboard_log
-                WHERE LOWER(driver_name) LIKE %s
-            """, (f"%{driver_name}%",))
+                SELECT COUNT(*) as total_events FROM leaderboard_log_left
+                WHERE LOWER(driver_name) LIKE %s AND position < 9999
+            """, (f"%{driver_name.lower()}%",))
             total_events = (await cursor.fetchone())["total_events"]
 
-            # Average position
+            # Average position (exclude 9999)
             await cursor.execute("""
-                SELECT AVG(position) as avg_position FROM leaderboard_log
-                WHERE LOWER(driver_name) LIKE %s
-            """, (f"%{driver_name}%",))
+                SELECT AVG(position) as avg_position FROM leaderboard_log_left
+                WHERE LOWER(driver_name) LIKE %s AND position < 9999
+            """, (f"%{driver_name.lower()}%",))
             avg_position = (await cursor.fetchone())["avg_position"]
 
-            # Best finish
+            # Best finish (exclude 9999)
             await cursor.execute("""
-                SELECT position, track_name FROM leaderboard_log
-                WHERE LOWER(driver_name) LIKE %s
+                SELECT position, track_name FROM leaderboard_log_left
+                WHERE LOWER(driver_name) LIKE %s AND position < 9999
                 ORDER BY position ASC LIMIT 1
-            """, (f"%{driver_name}%",))
+            """, (f"%{driver_name.lower()}%",))
             best_row = await cursor.fetchone()
-            best_finish = f"{best_row['position']}th in {best_row['track_name']}" if best_row else "N/A"
+            if best_row:
+                suffix = get_position_suffix(best_row['position'])
+                best_finish = f"{best_row['position']}{suffix} in {best_row['track_name']}"
+            else:
+                best_finish = "N/A"
 
             # Podiums
             await cursor.execute("""
-                SELECT COUNT(*) as podiums FROM leaderboard_log
-                WHERE driver_name LIKE %s AND position <= 3
-            """, (f"%{driver_name}%",))
+                SELECT COUNT(*) as podiums FROM leaderboard_log_left
+                WHERE LOWER(driver_name) LIKE %s AND position <= 3
+            """, (f"%{driver_name.lower()}%",))
             podiums = (await cursor.fetchone())["podiums"]
 
             # Wins
             await cursor.execute("""
-                SELECT COUNT(*) as wins FROM leaderboard_log
-                WHERE driver_name LIKE %s AND position = 1
-            """, (f"%{driver_name}%",))
+                SELECT COUNT(*) as wins FROM leaderboard_log_left
+                WHERE LOWER(driver_name) LIKE %s AND position = 1
+            """, (f"%{driver_name.lower()}%",))
             wins = (await cursor.fetchone())["wins"]
 
-            # Most used vehicle
+            # Most used vehicle — try LEFT first, fallback to RIGHT
             await cursor.execute("""
-                SELECT vehicle, COUNT(*) as count FROM leaderboard_log
-                WHERE driver_name LIKE %s AND vehicle IS NOT NULL AND vehicle != ''
+                SELECT vehicle, COUNT(*) as count FROM leaderboard_log_left
+                WHERE LOWER(driver_name) LIKE %s AND vehicle IS NOT NULL AND vehicle != ''
                 GROUP BY vehicle ORDER BY count DESC LIMIT 1
-            """, (f"%{driver_name}%",))
+            """, (f"%{driver_name.lower()}%",))
             vehicle_row = await cursor.fetchone()
+
+            if not vehicle_row:
+                # Fallback to RIGHT table
+                await cursor.execute("""
+                    SELECT vehicle, COUNT(*) as count FROM leaderboard_log
+                    WHERE LOWER(driver_name) LIKE %s AND vehicle IS NOT NULL AND vehicle != ''
+                    GROUP BY vehicle ORDER BY count DESC LIMIT 1
+                """, (f"%{driver_name.lower()}%",))
+                vehicle_row = await cursor.fetchone()
+
             most_vehicle = vehicle_row["vehicle"] if vehicle_row else "Unknown"
+
 
         conn.close()
 
-        # Read from standings.csv for total points
+        # Read points from CSV
         points = "N/A"
         standings_path = os.path.join(os.path.dirname(__file__), "standings.csv")
         try:
@@ -367,6 +395,8 @@ async def get_driver_stats(driver_name):
     except Exception as e:
         logging.error(f"[ERROR] get_driver_stats failed: {e}")
         return None
+
+
 
 
 async def get_driver_trend(driver_name):
@@ -429,7 +459,7 @@ async def get_driver_trend(driver_name):
 
                     line = f"{icon} Pos: {pos} {trend}\n⏱️ {time_total}\nGap: {gap}"
                 else:
-                    line = "❌ Did not participate"
+                    line = "❌ Did not complete"
                     previous_position = None  # Reset for skipped week
 
                 trend_data.append((label, line))
@@ -735,25 +765,25 @@ def parse_season_week_key(sw_key):
 
 
 # Function to log leaderboard data to MySQL
-async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None):
+async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None, url=None):
     try:
         conn = await get_db_connection()
         async with conn.cursor() as cursor:
-            # First delete all old entries for this track, season, and week
+            # === Step 1: Clear existing entries from RIGHT table ===
             await cursor.execute("""
                 DELETE FROM leaderboard_log 
                 WHERE track_name = %s AND season = %s AND week = %s
             """, (track_name, season, week))
 
-            # Now insert the fresh leaderboard
-            query = """
+            # === Step 2: Insert new RIGHT table entries ===
+            right_query = """
                 INSERT INTO leaderboard_log 
                 (track_name, position, driver_name, vehicle, time, diff_prev, diff_first, season, week)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
 
             for entry in leaderboard:
-                await cursor.execute(query, (
+                await cursor.execute(right_query, (
                     track_name,
                     int(entry.get("position", 0)),
                     entry.get("name"),
@@ -765,10 +795,127 @@ async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None)
                     week
                 ))
 
+            # === Step 3: Also scrape and log LEFT table if URL is provided ===
+            if url:
+
+                left_leaderboard = scrape_left_leaderboard(url)
+                #print(f"📥 Found {len(left_leaderboard)} LEFT entries for {track_name}")
+
+                # Remove old LEFT entries for this track/week
+                await cursor.execute("""
+                    DELETE FROM leaderboard_log_left 
+                    WHERE track_name = %s AND season = %s AND week = %s
+                """, (track_name, season, week))
+
+                # Insert new LEFT entries
+                left_query = """
+                    INSERT INTO leaderboard_log_left 
+                    (track_name, position, driver_name, vehicle, time, diff_prev, diff_first, season, week)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+
+                for entry in left_leaderboard:
+                    await cursor.execute(left_query, (
+                        track_name,
+                        int(entry.get("position", 0)),
+                        entry.get("name"),
+                        entry.get("vehicle", ""),
+                        entry.get("time", ""),
+                        entry.get("diff_prev", ""),
+                        entry.get("diff_first", ""),
+                        season,
+                        week
+                    ))
+
         await conn.ensure_closed()
-        print(f"✅ Replaced leaderboard entries for {track_name}.")
+        print(f"✅ Logged RIGHT and LEFT leaderboard entries for {track_name}")
+
     except Exception as e:
         print(f"❌ Failed to update leaderboard for {track_name}: {e}")
+
+
+
+async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None, url=None):
+    try:
+        conn = await get_db_connection()
+        async with conn.cursor() as cursor:
+            # === Step 1: Clear existing entries from RIGHT table ===
+            await cursor.execute("""
+                DELETE FROM leaderboard_log 
+                WHERE track_name = %s AND season = %s AND week = %s
+            """, (track_name, season, week))
+
+            # === Step 2: Insert new RIGHT table entries ===
+            right_query = """
+                INSERT INTO leaderboard_log 
+                (track_name, position, driver_name, vehicle, time, diff_prev, diff_first, season, week)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+
+            for entry in leaderboard:
+                await cursor.execute(right_query, (
+                    track_name,
+                    int(entry.get("position", 0)),
+                    entry.get("name"),
+                    entry.get("vehicle"),
+                    entry.get("time", ""),
+                    entry.get("diff_prev", ""),
+                    entry.get("diff_first", ""),
+                    season,
+                    week
+                ))
+
+            # === Step 3: Also scrape and log LEFT table if URL is provided ===
+            if url:
+                left_leaderboard = scrape_left_leaderboard(url)
+                #print(f"📥 Found {len(left_leaderboard)} LEFT entries for {track_name}")
+
+                # Remove old LEFT entries for this track/week
+                await cursor.execute("""
+                    DELETE FROM leaderboard_log_left 
+                    WHERE track_name = %s AND season = %s AND week = %s
+                """, (track_name, season, week))
+
+                # Insert new LEFT entries
+                left_query = """
+                    INSERT INTO leaderboard_log_left 
+                    (track_name, position, driver_name, vehicle, time, diff_prev, diff_first, season, week)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+
+                for entry in left_leaderboard:
+                    raw_pos = entry.get("position", "0")
+                    try:
+                        position = int(raw_pos)
+                    except Exception:
+                        logging.warning(f"[Fallback] Non-numeric position: '{raw_pos}' in {track_name} — using 9999")
+                        position = 9999  # fallback for SR, RET, etc.
+
+                    try:
+                        await cursor.execute(left_query, (
+                            track_name,
+                            position,
+                            entry.get("name"),
+                            entry.get("vehicle", ""),
+                            entry.get("time", ""),
+                            entry.get("diff_prev", ""),
+                            entry.get("diff_first", ""),
+                            season,
+                            week
+                        ))
+                    except Exception as e:
+                        logging.error(f"❌ LEFT insert failed for {track_name} entry {entry}: {e}")
+
+        await conn.ensure_closed()
+        print(f"✅ Logged RIGHT and LEFT leaderboard entries for {track_name}")
+
+    except Exception as e:
+        print(f"❌ Failed to update leaderboard for {track_name}: {e}")
+
+
+
+
+
 
 
 
@@ -1035,6 +1182,53 @@ def scrape_general_leaderboard(url, table_class="rally_results"):
     scraping_logger.info(f"✅ Final leaderboard ({len(leaderboard)} entries) for {url}")
     return leaderboard, soup
 
+def scrape_left_leaderboard(url, table_class="rally_results_stres_left"):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        scraping_logger.warning(f"Unable to fetch the page for {url} (Status code: {response.status_code})")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    leaderboard = []
+    tables = soup.find_all("table", {"class": table_class})
+
+    if not tables:
+        scraping_logger.warning(f"[LEFT] Table not found for {url}")
+        return []
+
+    table = tables[1] if len(tables) > 1 else tables[0]  # fallback
+    rows = table.find_all("tr")
+
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) >= 5:
+            position = cols[0].text.strip()
+            name_vehicle = cols[1].text.strip()
+            time = cols[2].text.strip()
+            diff_prev = cols[3].text.strip()
+            diff_first = cols[4].text.strip()
+
+            name_parts = name_vehicle.split(" / ", 1)
+            name1 = name_parts[0].strip()
+            name2 = name_parts[1].strip() if len(name_parts) > 1 else ""
+            vehicle = ""  # You can apply brand logic here again if needed
+
+            full_name = f"{name1} / {name2}" if name2 else name1
+
+            leaderboard.append({
+                "position": position,
+                "name": full_name,
+                "vehicle": vehicle,
+                "time": time,
+                "diff_prev": diff_prev,
+                "diff_first": diff_first
+            })
+
+    scraping_logger.info(f"✅ [LEFT] Scraped {len(leaderboard)} entries from {url}")
+    return leaderboard
+
 
 def get_season_week_from_page(url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -1223,7 +1417,8 @@ async def process_past_weeks(channel):
                     if leaderboard:
                         track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
                         await safe_db_call(update_previous_leader, track_name, leaderboard[0]["name"])
-                        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
+                        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week, url)
+
 
             # ✅ Log general leaderboard for past week
             leaderboard_url = get_leaderboard_url(season, week)
@@ -1331,7 +1526,8 @@ async def check_current_week_loop(channel):
                             await channel.send(embed=embed)
 
                         await safe_db_call(update_previous_leader, track_name, current_leader)
-                        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
+                        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week, url)
+
 
             # 🧠 FIXED: Use current season/week instead of stale globals
             leaderboard_url = get_leaderboard_url(season, week)
@@ -1422,7 +1618,7 @@ async def check_leader_change():
                                 await channel.send(embed=embed)
 
                             await safe_db_call(update_previous_leader, track_name, current_leader)
-                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week)
+                            await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week, url)
 
             # Scrape general leaderboard
             season, week = get_latest_season_and_week()
@@ -1490,6 +1686,68 @@ async def on_ready():
 
 
 # ---- Command Handlers ----
+
+async def handle_skillissue_command(message):
+    try:
+        season, week = get_latest_season_and_week()
+        conn = await get_db_connection()
+
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT driver_name, vehicle, position, diff_first
+                FROM general_leaderboard_log
+                WHERE season = %s AND week = %s AND position < 9999
+                ORDER BY position DESC
+                LIMIT 1
+            """, (season, week))
+
+            row = await cursor.fetchone()
+
+        conn.close()
+
+        if not row:
+            await message.channel.send("⚠️ No results found for the current week.")
+            return
+
+        name = row["driver_name"]
+        vehicle = row["vehicle"] or "Unknown"
+        pos = row["position"]
+        gap = row["diff_first"] or "N/A"
+
+        # 🧠 Motivational tip pool
+        tips = [
+            "Every legend was once the last on the leaderboard.",
+            "Your comeback story starts now. 📈",
+            "Even Loeb had to restart stages sometimes.",
+            "Next week is a clean slate. Don't lift!",
+            "Shake it off — the forest will forgive you.",
+            "DNFs build character. Probably.",
+            "The only way from here is up! 🚀"
+        ]
+
+        tip = random.choice(tips)
+
+        embed = discord.Embed(
+            title="💥 Skill Issue Detected!",
+            description=(
+                f"**{name}** finished in **last place** (Pos {pos}) for Season {season}, Week {week}.\n"
+                f"🏎️ Vehicle: {vehicle}\n"
+                f"⏱️ Gap to leader: {gap}\n\n"
+                f"{tip}"
+            ),
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="See you at the next stage!")
+
+        await message.channel.send(embed=embed)
+
+    except Exception as e:
+        logging.error(f"[ERROR] handle_skillissue_command failed: {e}")
+        await message.channel.send("❌ Could not determine who had the skill issue.")
+
+
+
+
 
 async def handle_history_command(message):
     parts = message.content.strip().split()
@@ -1860,11 +2118,13 @@ async def handle_cmd_command(message):
 async def on_message(message):
     if message.author == bot.user:
         return
-        # ✅ Only allow commands from a specific channel
-        allowed_channel_id = 1348069119685296220  # 🔁 Replace this with your actual channel ID
-        if message.channel.id != allowed_channel_id:
-            return
-    
+
+    # ✅ Only allow commands from a specific channel
+    allowed_channel_id = 1111111111111111111  # 🔁 Replace this with your actual channel ID
+    if message.channel.id != allowed_channel_id:
+        return
+
+
     if message.content.startswith("!compare"):
         await handle_compare_command(message)
     elif message.content.startswith("!leaderboard"):
@@ -1885,6 +2145,8 @@ async def on_message(message):
         await handle_trend_command(message)
     elif message.content.startswith("!history"):
         await handle_history_command(message)
+    elif message.content.startswith("!skillissue"):
+        await handle_skillissue_command(message)
     elif message.content.startswith("!points"):
         file_path = os.path.join(os.path.dirname(__file__), "standings.csv")
         if not os.path.exists(file_path):
