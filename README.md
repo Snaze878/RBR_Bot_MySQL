@@ -77,11 +77,17 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 ## 📸 Example Bot Output
 
 
-![Screenshot 2025-04-12 140956](https://github.com/user-attachments/assets/90b1d28f-da66-4c3d-802e-830d6a74555c)
-![Screenshot 2025-04-12 141011](https://github.com/user-attachments/assets/19732ff9-c940-434e-a30d-d2083f5d8f8c)
-![Screenshot 2025-04-12 141022](https://github.com/user-attachments/assets/ec90fb46-e554-4c52-b394-a3755f76c0d3)
-![Screenshot 2025-04-12 141037](https://github.com/user-attachments/assets/250b7ff8-7e20-4422-9538-f18af0a84f6c)
-![Screenshot 2025-04-12 141119](https://github.com/user-attachments/assets/7ccdfff6-0e4c-4047-b29c-deb27f43c63f)
+<details>
+<summary>📸 Click to view example bot output</summary>
+
+![General Leaderboard](https://github.com/user-attachments/assets/90b1d28f-da66-4c3d-802e-830d6a74555c)
+![Points Standings](https://github.com/user-attachments/assets/19732ff9-c940-434e-a30d-d2083f5d8f8c)
+![Search](https://github.com/user-attachments/assets/ec90fb46-e554-4c52-b394-a3755f76c0d3)
+![Leg](https://github.com/user-attachments/assets/250b7ff8-7e20-4422-9538-f18af0a84f6c)
+![Stats](https://github.com/user-attachments/assets/7ccdfff6-0e4c-4047-b29c-deb27f43c63f)
+
+</details>
+
 
 ---
 
