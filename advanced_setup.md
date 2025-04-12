@@ -142,6 +142,25 @@ The bot will load all environment variables and rally configuration from the she
 
 ---
 
+## ⚙️ Optional: Auto-Restart Script for Bot
+
+To support the `!restart` command, create a `.cmd` file in your bot folder:
+
+### `run_bot.cmd`
+```cmd
+@echo off
+:loop
+echo [BOT] Starting...
+python RBR_Bot.py
+echo [BOT] Restarting in 3 seconds...
+timeout /t 3 >nul
+goto loop
+```
+
+Run this file instead of `python RBR_Bot.py` to allow restart functionality.
+
+---
+
 ## 🔁 Ongoing Use
 - Add a new row in your Google Sheet for each new rally week.
 - Run `!sync` to update.
