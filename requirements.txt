@@ -8,3 +8,4 @@ webdriver-manager
 cryptography
 gspread
 oauth2client
+aiohttp
