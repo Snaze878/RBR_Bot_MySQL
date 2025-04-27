@@ -7,6 +7,7 @@ import time
 import csv
 import logging
 import sys
+import subprocess
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -23,6 +24,10 @@ from collections import defaultdict
 from discord.ui import View, Button
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+restarting = False
+RESTARTED = "--restart" in sys.argv 
+
+DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 
 
 # Reconnect tracking
@@ -69,6 +74,14 @@ error_handler = create_logger_handler("error_log", level=logging.WARNING)
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 root_logger.addHandler(error_handler)
+
+from dotenv import dotenv_values
+
+async def load_env_data():
+    global env_data
+    env_data = dotenv_values(".env")
+    print("🔁 Reloaded .env → latest env_data now in memory.")
+
 
 
 # --- Environment Loading ---
@@ -308,24 +321,15 @@ async def handle_sync_command(message):
         await message.channel.send("❌ Sync failed due to an internal error.")
 
 
-def start_background_task(name: str, coro: callable):
-    reload_env()
-    global running_tasks
+background_tasks = {}
 
-    if name in running_tasks and not running_tasks[name].done():
-        logging.info(f"🔁 Task '{name}' is already running. Skipping duplicate launch.")
-        return
+def start_background_task(name, coro):
+    if name in background_tasks:
+        task = background_tasks[name]
+        if not task.done():
+            task.cancel()
+    background_tasks[name] = asyncio.create_task(coro)
 
-    task = asyncio.create_task(coro)
-
-    def cleanup(_):
-        if name in running_tasks and running_tasks[name].done():
-            del running_tasks[name]
-            logging.info(f"🧹 Task '{name}' finished and was cleaned up.")
-
-    task.add_done_callback(cleanup)
-    running_tasks[name] = task
-    logging.info(f"🚀 Started task: {name}")
 
 
 
@@ -486,7 +490,7 @@ async def get_driver_stats(driver_name):
     try:
         conn = await get_db_connection()
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            # ✅ First check if driver exists in leaderboard_log_left
+            # ✅ First check if driver exists
             await cursor.execute("""
                 SELECT COUNT(*) as exists_check
                 FROM leaderboard_log_left
@@ -496,7 +500,7 @@ async def get_driver_stats(driver_name):
             if not exists_row or exists_row["exists_check"] == 0:
                 return f"❌ No records found for **{driver_name}**. Please check the spelling or try a different name."
 
-            # Total events (exclude 9999)
+            # Total events
             await cursor.execute("""
                 SELECT COUNT(*) as total_events FROM leaderboard_log_left
                 WHERE LOWER(driver_name) LIKE %s AND position < 9999
@@ -536,7 +540,7 @@ async def get_driver_stats(driver_name):
             """, (f"%{driver_name.lower()}%",))
             wins = (await cursor.fetchone())["wins"]
 
-            # Most Used Vehicle (LEFT → fallback RIGHT)
+            # Most Used Vehicle
             await cursor.execute("""
                 SELECT vehicle, COUNT(*) as count FROM leaderboard_log_left
                 WHERE LOWER(driver_name) LIKE %s AND vehicle IS NOT NULL AND vehicle != ''
@@ -554,20 +558,23 @@ async def get_driver_stats(driver_name):
 
         await conn.ensure_closed()
 
-        # ✅ Pull points
+        # 🔥 Pull Points (fixed!)
         season, _ = get_latest_season_and_week()
         conn2 = await get_db_connection()
         async with conn2.cursor(aiomysql.DictCursor) as cursor2:
             await cursor2.execute("""
                 SELECT points FROM season_points
-                WHERE LOWER(driver_name) LIKE %s AND season = %s
+                WHERE REPLACE(REPLACE(LOWER(driver_name), '  ', ' '), '  ', ' ') LIKE %s
+                AND season = %s
                 LIMIT 1
-            """, (f"%{driver_name.lower()}%", season))
+            """, (f"%{driver_name.lower().replace('  ', ' ')}%", season))
             result = await cursor2.fetchone()
-            points = result['points'] if result else "N/A"
 
+            points = f"{result['points']} pts" if result and result.get('points') is not None else "No points earned yet!"
         await conn2.ensure_closed()
 
+
+        # 🖼️ Build Embed
         embed = discord.Embed(
             title=f"📊 Stats for {driver_name}",
             color=discord.Color.teal()
@@ -578,13 +585,14 @@ async def get_driver_stats(driver_name):
         embed.add_field(name="🥇 Wins", value=wins, inline=True)
         embed.add_field(name="🥉 Podiums", value=podiums, inline=True)
         embed.add_field(name="🏎️ Most Used Car", value=most_vehicle, inline=False)
-        embed.add_field(name="🏁 Points", value=f"{points} pts", inline=False)
+        embed.add_field(name="🏁 Points", value=points, inline=False)
 
         return embed
 
     except Exception as e:
         logging.error(f"[ERROR] get_driver_stats failed: {e}")
         return "❌ Something went wrong fetching stats."
+
 
 
 
@@ -797,141 +805,158 @@ async def get_latest_left_leader(track_name, season, week):
 
 
 
+
+# Helper to normalize names (collapse spaces)
+def normalize(text):
+    return re.sub(r"\s+", " ", text.strip().lower())
+
 async def show_driver_results(driver_name, season=None, week=None):
     try:
         if season is None or week is None:
             season, week = get_latest_season_and_week()
 
-        leaderboard_url = get_leaderboard_url(season, week)
-
+        name_parts = [p.strip() for p in driver_name.split("/") if p.strip()]
         conn = await get_db_connection()
+
+        # --- Get vehicle ---
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("""
+            vehicle_query = """
                 SELECT vehicle FROM leaderboard_log
-                WHERE driver_name LIKE %s AND season = %s AND week = %s
-                AND vehicle IS NOT NULL AND vehicle != ''
-                LIMIT 1
-            """, (f"%{driver_name}%", season, week))
+                WHERE season = %s AND week = %s
+                AND (""" + " OR ".join(["LOWER(driver_name) LIKE %s" for _ in name_parts]) + ") LIMIT 1"
+            vehicle_params = [season, week] + [f"%{part.lower()}%" for part in name_parts]
+            await cursor.execute(vehicle_query, vehicle_params)
+            vehicle_row = await cursor.fetchone()
+            vehicle = vehicle_row["vehicle"] if vehicle_row else "Unknown"
 
-            vehicle_result = await cursor.fetchone()
-            vehicle = vehicle_result['vehicle'] if vehicle_result else "Unknown"
+        # --- Get current position and gap ---
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            pos_query = """
+                SELECT position, diff_first FROM general_leaderboard_log
+                WHERE season = %s AND week = %s
+                AND (""" + " OR ".join(["LOWER(driver_name) LIKE %s" for _ in name_parts]) + ") LIMIT 1"
+            pos_params = [season, week] + [f"%{part.lower()}%" for part in name_parts]
+            await cursor.execute(pos_query, pos_params)
+            pos_row = await cursor.fetchone()
 
-            await cursor.execute("""
-                SELECT track_name, position, diff_first
-                FROM leaderboard_log
-                WHERE driver_name LIKE %s AND season = %s AND week = %s
-                ORDER BY scraped_at DESC
-            """, (f"%{driver_name}%", season, week))
+        current_position = pos_row["position"] if pos_row else None
+        time_gap = pos_row["diff_first"] if pos_row else None
 
-            results = await cursor.fetchall()
+        # --- Get points ---
+        points = await get_driver_points(driver_name)
+
+        # --- Stage Completion Info ---
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            stage_query = """
+                SELECT track_name FROM leaderboard_log_left
+                WHERE season = %s AND week = %s
+                AND (""" + " OR ".join(["LOWER(driver_name) LIKE %s" for _ in name_parts]) + ")"
+            stage_params = [season, week] + [f"%{part.lower()}%" for part in name_parts]
+            await cursor.execute(stage_query, stage_params)
+            finished_stages = {row['track_name'] for row in await cursor.fetchall()}
+
         await conn.ensure_closed()
 
-        if not results:
-            return f"⚠️ No results found for `{driver_name}` in Season {season}, Week {week}."
+        expected_tracks = build_expected_stage_list(season, week)
 
-        general_leaderboard, _ = await scrape_general_leaderboard(leaderboard_url)
-        name_parts = [p.strip() for p in driver_name.split("/") if p.strip()]
-
-        current_overall = next(
-            (entry for entry in general_leaderboard
-             if any(part.lower() in entry['name'].lower() for part in name_parts)),
-            None
-        )
-
-        if not current_overall:
-            current_overall = next(
-                (entry for entry in general_leaderboard if driver_name.lower() in entry["name"].lower()),
-                None
-            )
-
-        # 🔄 Pull points from season_points table
-        points_line = "N/A"
-        season, _ = get_latest_season_and_week()
-
-        try:
-            conn = await get_db_connection()
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
-                name_parts = [p.strip().lower() for p in driver_name.split("/") if p.strip()]
-                like_clauses = " OR ".join(["LOWER(driver_name) LIKE %s" for _ in name_parts])
-                query = f"""
-                    SELECT points FROM season_points
-                    WHERE season = %s AND ({like_clauses})
-                    ORDER BY points DESC LIMIT 1
-                """
-                await cursor.execute(query, [season] + [f"%{part}%" for part in name_parts])
-                row = await cursor.fetchone()
-                if row:
-                    points_line = row["points"]
-            await conn.ensure_closed()
-        except Exception as e:
-            logging.warning(f"Could not retrieve points from DB: {e}")
-
-
-        # Organize results per leg
-        organized = defaultdict(list)
-        for entry in results:
-            raw_track = entry.get("track_name", "")
-            position = entry.get("position", "?")
-            diff_first = entry.get("diff_first", "?")
-
-            match = re.search(r"Leg\s*(\d+).+Stage\s*(\d+)", raw_track)
-            if match:
-                leg_num = int(match.group(1))
-                stage_num = int(match.group(2))
-                track_label = f"Stage {stage_num}"
-                line = f"**Pos - {position}** {track_label} ⏳ ({diff_first})"
-                organized[f"Leg {leg_num}"].append((stage_num, line))
-
-        formatted_blocks = []
-        for leg in sorted(organized.keys(), key=lambda x: int(x.split()[1])):
-            stage_lines = sorted(organized[leg])
-            block = f"{leg}\n" + "\n".join(line for _, line in stage_lines)
-            formatted_blocks.append(block)
-
-        matched_name = current_overall['name'] if current_overall else driver_name
-
-        # --- Create Embed ---
+        # --- Build Embed ---
         embed = discord.Embed(
             title=f"🔍 Results for {driver_name}",
             description=f"Season {season}, Week {week}",
             color=discord.Color.green()
         )
 
-        if current_overall:
-            embed.add_field(name="📊 Current Position", value=current_overall['position'], inline=False)
-            embed.add_field(name="⏱️ Time Diff", value=current_overall['diff_first'], inline=False)
+        if current_position:
+            embed.add_field(name="📋 Current Position", value=f"#{current_position}", inline=False)
+            if time_gap:
+                embed.add_field(name="⏱️ Gap to Leader", value=time_gap, inline=False)
         else:
-            embed.add_field(name="📊 Current Position", value="Not Found", inline=False)
+            embed.add_field(name="📋 Current Position", value="Not Found", inline=False)
 
         embed.add_field(name="🏎️ Vehicle", value=vehicle, inline=False)
 
-        if points_line:
-            embed.add_field(name="🏁 Points", value=f"{points_line} pts", inline=False)
+        if points and points != "N/A":
+            embed.add_field(name="🎁 Points", value=f"{points} pts", inline=False)
+        else:
+            embed.add_field(name="🎁 Points", value="No points earned yet.", inline=False)
 
-        # Add empty line to give spacing before legs
-        embed.add_field(name="\u200B", value="\u200B", inline=False)
+        # --- Stage Progress ---
+        completed = 0
+        total_stages = sum(len(v) for v in expected_tracks.values())
+        for leg_num in sorted(expected_tracks.keys()):
+            stage_lines = []
+            for stage in expected_tracks[leg_num]:
+                if stage in finished_stages:
+                    stage_lines.append(f"✅ {stage}")
+                    completed += 1
+                else:
+                    stage_lines.append(f"❌ {stage}")
 
-        # Stage/leg breakdown
-        for block in formatted_blocks:
-            lines = block.split("\n")
-            title = lines[0]
-            value = "\n".join(lines[1:])
-            embed.add_field(name=title, value=value, inline=False)
+            if stage_lines:
+                value = "\n".join(stage_lines)
+                embed.add_field(name=f"Leg {leg_num}", value=value, inline=False)
 
+        stage_progress_text = (
+            f"✅ {completed}/{total_stages} stages completed!"
+            if completed == total_stages
+            else f"{completed}/{total_stages} stages completed"
+        )
+        embed.add_field(name="⏱️ Stage Progress", value=stage_progress_text, inline=False)
+
+        embed.set_footer(text=f"Matched: {driver_name}")
         return embed
 
-
-
     except Exception as e:
-        logging.error(f"[ERROR] show_driver_results failed: {e}")
+        logging.error(f"[CRITICAL] show_driver_results completely failed: {e}")
         return "❌ An error occurred while building driver results."
 
+
+
+# Helper to build expected track names based on week config
+def build_expected_stage_list(season, week):
+    leg_urls = build_urls_for_week(season, week)
+    expected = {}
+    for leg, stages in leg_urls.items():
+        expected[leg] = [f"S{season}W{week} - Leg {leg} (Stage {s})" for s in stages]
+    return expected
+
+
+
+
+async def get_driver_points(driver_name):
+    try:
+        season, _ = get_latest_season_and_week()
+        normalized_driver_name = normalize(driver_name)
+        name_parts = [p.strip() for p in normalized_driver_name.split("/") if p.strip()]
+
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            points_query = """
+                SELECT points FROM season_points
+                WHERE season = %s
+                AND (""" + " OR ".join(["LOWER(driver_name) LIKE %s" for _ in name_parts]) + ") LIMIT 1"
+            points_params = [season] + [f"%{part}%" for part in name_parts]
+            await cursor.execute(points_query, points_params)
+            points_row = await cursor.fetchone()
+
+        await conn.ensure_closed()
+
+        return points_row["points"] if points_row else "N/A"
+
+    except Exception as e:
+        logging.error(f"[ERROR] get_driver_points failed: {e}")
+        return "N/A"
 
 
 
 # Function to update the leader in DB
 async def update_previous_leader(track_name, leader_name):
     try:
+        # Sanity check: don't update if leader_name is bad
+        if not leader_name or leader_name.strip().lower() == "driver":
+            logging.info(f"⏭️ Skipping invalid leader update for {track_name}: {leader_name}")
+            return
+
         conn = await get_db_connection()
         async with conn.cursor() as cursor:
             await cursor.execute(
@@ -939,6 +964,8 @@ async def update_previous_leader(track_name, leader_name):
                 (track_name, leader_name)
             )
         await conn.ensure_closed()
+        logging.info(f"✅ Updated previous leader for {track_name}: {leader_name}")
+
     except Exception as e:
         logging.error(f"❌ Failed to update previous leader for {track_name}: {e}")
 
@@ -982,21 +1009,36 @@ def get_latest_season_and_week():
 
 
 
-
-
 async def log_general_leaderboard_to_db(season, week, soup):
-    scraping_logger.info(f"🔁 Starting general leaderboard log for Season {season}, Week {week}")
+    scraping_logger.info(f"✫ Starting general leaderboard log for Season {season}, Week {week}")
+
     tables = soup.find_all("table", {"class": "rally_results"})
     if not tables:
         scraping_logger.warning("❌ No tables found for general leaderboard.")
         return
 
-    results_table = next((t for t in tables if len(t.find_all("tr")) > 1), None)
+    # 🔎 Smart table selection based on first column being a number
+    results_table = None
+    for table in tables:
+        rows = table.find_all("tr")
+        if len(rows) >= 1:
+            first_row_cols = rows[0].find_all("td")
+            if first_row_cols:
+                first_col_text = first_row_cols[0].text.strip()
+                try:
+                    int(first_col_text)  # Try to parse position
+                    results_table = table
+                    break  # ✅ Found valid table
+                except ValueError:
+                    continue
+
     if not results_table:
-        scraping_logger.warning("❌ No valid results table found.")
+        scraping_logger.warning("❌ No valid general leaderboard results table found.")
         return
 
     rows = results_table.find_all("tr")
+    scraping_logger.info(f"🔎 Found {len(rows)} rows in general leaderboard results table.")
+
     conn = await get_db_connection()
     async with conn.cursor() as cursor:
         # 🔥 Delete old general leaderboard entries for this season/week
@@ -1005,27 +1047,46 @@ async def log_general_leaderboard_to_db(season, week, soup):
             WHERE season = %s AND week = %s
         """, (season, week))
 
+        inserted_rows = 0
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) >= 7:  # changed from 6 to 7 due to extra column
+            if len(cols) >= 7:
                 try:
-                    position = int(cols[0].text.strip())
+                    position_text = cols[0].text.strip()
                     driver_name = cols[1].text.strip()
-                    vehicle = cols[3].text.strip()       # fixed index
-                    time = cols[4].text.strip()
+                    vehicle = cols[3].text.strip()
+
+                    bold_tag = cols[4].find("b")
+                    time = bold_tag.text.strip() if bold_tag else cols[4].text.strip()
+
                     diff_prev = cols[5].text.strip()
                     diff_first = cols[6].text.strip()
+
+                    # Validate position is a number
+                    try:
+                        position = int(position_text)
+                    except ValueError:
+                        scraping_logger.info(f"[DEBUG] Skipping row with non-integer position: {position_text}")
+                        continue
 
                     await cursor.execute("""
                         INSERT INTO general_leaderboard_log 
                         (driver_name, position, vehicle, time, diff_prev, diff_first, season, week)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                     """, (driver_name, position, vehicle, time, diff_prev, diff_first, season, week))
+
+                    inserted_rows += 1
                 except Exception as e:
                     scraping_logger.error(f"⚠️ Failed to insert row: {e}")
+
+
     await conn.ensure_closed()
-    scraping_logger.info(f"✅ Replaced general leaderboard entries for S{season}W{week}")
-    print(f"✅ Logged general leaderboard entries for S{season}W{week}")
+
+    if inserted_rows > 0:
+        scraping_logger.info(f"✅ Inserted {inserted_rows} general leaderboard entries for S{season}W{week}")
+        print(f"✅ Logged general leaderboard entries for S{season}W{week}")
+    else:
+        scraping_logger.warning(f"⚠️ No valid driver entries found for S{season}W{week}!")
 
 
 
@@ -1058,13 +1119,33 @@ async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None,
                 (track_name, position, driver_name, vehicle, time, diff_prev, diff_first, season, week)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
+
+            last_valid_position = None  # 🏁 New tracker
+
             for entry in leaderboard:
+                raw_pos = str(entry.get("position", "")).strip()
+
+                try:
+                    if raw_pos.isdigit():
+                        position = int(raw_pos)
+                        last_valid_position = position
+                    elif raw_pos == "=":
+                        position = last_valid_position if last_valid_position is not None else 9999
+                    elif raw_pos == "SR":
+                        position = (last_valid_position + 1) if last_valid_position is not None else 9999
+                    else:
+                        position = 9999
+                        logging.warning(f"[WARNING] Unhandled position '{raw_pos}' — using 9999.")
+                except Exception as e:
+                    logging.warning(f"[Fallback] Problem parsing position: {raw_pos} for {track_name} — {e}")
+                    position = 9999
+
                 try:
                     await cursor.execute(right_query, (
                         track_name,
-                        int(entry.get("position", 0)),
+                        position,
                         entry.get("name"),
-                        entry.get("vehicle"),
+                        entry.get("vehicle", ""),
                         entry.get("time", ""),
                         entry.get("diff_prev", ""),
                         entry.get("diff_first", ""),
@@ -1090,12 +1171,24 @@ async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None,
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
 
-                for entry in left_leaderboard:
-                    raw_pos = entry.get("position", "0")
+                last_real_position = None  # 🏁 New tracker for LEFT side
+
+                for entry in left_leaderboard:  # 🛠️ Fix: use left_leaderboard, not leaderboard
+                    raw_pos = str(entry.get("position", "")).strip()
+
                     try:
-                        position = int(raw_pos)
-                    except Exception:
-                        logging.warning(f"[Fallback] Non-numeric position: '{raw_pos}' in {track_name} — using 9999")
+                        if raw_pos.isdigit():
+                            position = int(raw_pos)
+                            last_real_position = position
+                        elif raw_pos == "=":
+                            position = last_real_position if last_real_position is not None else 9999
+                        elif raw_pos == "SR":
+                            position = (last_real_position + 1) if last_real_position is not None else 9999
+                        else:
+                            position = 9999
+                            logging.warning(f"[WARNING] Unhandled position '{raw_pos}' — using 9999.")
+                    except Exception as e:
+                        logging.warning(f"[Fallback] Problem parsing position: {raw_pos} for {track_name} — {e}")
                         position = 9999
 
                     try:
@@ -1111,13 +1204,14 @@ async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None,
                             week
                         ))
                     except Exception as e:
-                        logging.error(f"❌ LEFT insert failed for {track_name} entry {entry}: {e}")
+                        logging.warning(f"⚠️ LEFT insert failed for {track_name}: {e}")
 
         await conn.ensure_closed()
         print(f"✅ Logged RIGHT and LEFT leaderboard entries for {track_name}")
 
     except Exception as e:
         logging.error(f"❌ Failed to update leaderboard for {track_name}: {e}")
+
 
 
 
@@ -1499,7 +1593,7 @@ class LeaderboardLinkView(View):
             if isinstance(url, str):
                 self.add_item(Button(label=label, url=url))
 
-async def scrape_general_leaderboard(url, table_class="rally_results", max_retries=999999, retry_delay=30):
+async def scrape_general_leaderboard(url, table_class="rally_results", max_retries=3, retry_delay=5):
     headers = {"User-Agent": "Mozilla/5.0"}
 
     for attempt in range(max_retries):
@@ -1511,43 +1605,49 @@ async def scrape_general_leaderboard(url, table_class="rally_results", max_retri
                     text = await response.text()
                     break
         except Exception as e:
-            logging.warning(f"[GENERAL] Error fetching {url} (Attempt {attempt + 1}): {e}. Retrying in {retry_delay}s...")
+            print(f"[scrape_general_leaderboard] Error fetching {url} (Attempt {attempt+1}): {e}")
             await asyncio.sleep(retry_delay)
     else:
-        logging.error(f"[GENERAL] Max retries exceeded for {url}")
+        print(f"[scrape_general_leaderboard] Max retries exceeded for {url}")
         return [], None
 
     soup = BeautifulSoup(text, "html.parser")
     tables = soup.find_all("table", {"class": table_class})
+
     if not tables:
-        logging.warning(f"[GENERAL] Table not found for {url}!")
+        print("[scrape_general_leaderboard] ❌ No tables found.")
         return [], soup
 
+    results_table = next((t for t in tables if len(t.find_all("tr")) > 0), None)
+    if not results_table:
+        return [], soup
+
+    rows = results_table.find_all("tr")
     leaderboard = []
 
-    for t in tables:
-        rows = t.find_all("tr")
-        if len(rows) < 2:
-            continue
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) >= 7:
+            bold_tag = cols[4].find("b")
+            time = bold_tag.text.strip() if bold_tag else ""
 
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) >= 8:
-                entry = {
-                    "position": cols[0].text.strip(),
-                    "name": cols[1].text.strip(),
-                    "vehicle": cols[3].text.strip(),
-                    "time": cols[4].text.strip(),
-                    "diff_prev": cols[5].text.strip(),
-                    "diff_first": cols[6].text.strip()
-                }
-                leaderboard.append(entry)
+            entry = {
+                "position": cols[0].get_text(strip=True),
+                "name": cols[1].get_text(strip=True),
+                "vehicle": cols[3].get_text(strip=True),
+                "time": time,
+                "diff_prev": cols[5].get_text(strip=True),
+                "diff_first": cols[6].get_text(strip=True)
+            }
+            leaderboard.append(entry)
 
-        if leaderboard:
-            break
 
-    logging.info(f"✅ [GENERAL] Scraped {len(leaderboard)} entries from {url}")
+
+
+
     return leaderboard, soup
+
+
 
 
 async def get_all_driver_names():
@@ -1563,7 +1663,7 @@ async def scrape_left_leaderboard(url, table_class="rally_results_stres_left", m
     headers = {"User-Agent": "Mozilla/5.0"}
     vehicle_starts = ["Citroen", "Ford", "Peugeot", "Opel", "Abarth", "Skoda", "Mitsubishi", "Subaru", "BMW", "GM", "GMC",
                       "Toyota", "Honda", "Suzuki", "Acura", "Audi", "Volkswagen", "Chevrolet", "Volvo", "Kia", "Jeep", "Dodge",
-                      "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia"]
+                      "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia", "Fiat"]
 
     for attempt in range(max_retries):
         try:
@@ -1595,7 +1695,11 @@ async def scrape_left_leaderboard(url, table_class="rally_results_stres_left", m
         if len(cols) >= 5:
             position = cols[0].text.strip()
             name_vehicle = cols[1].text.strip()
-            time = cols[2].text.strip()
+
+            # 🛠 Prefer the <b> tag inside time column
+            bold_time_tag = cols[2].find("b")
+            time = bold_time_tag.text.strip() if bold_time_tag else cols[2].text.strip()
+
             diff_prev = cols[3].text.strip()
             diff_first = cols[4].text.strip()
 
@@ -1637,9 +1741,6 @@ async def scrape_left_leaderboard(url, table_class="rally_results_stres_left", m
 
     logging.info(f"✅ [LEFT] Scraped {len(leaderboard)} entries from {url}")
     return leaderboard
-
-
-
 
 
 
@@ -1723,7 +1824,7 @@ async def scrape_leaderboard(url, table_class="rally_results_stres_right"):
     vehicle_starts = [
         "Citroen", "Ford", "Peugeot", "Opel", "Abarth", "Skoda", "Mitsubishi", "Subaru", "BMW", "GM", "GMC",
         "Toyota", "Honda", "Suzuki", "Acura", "Audi", "Volkswagen", "Chevrolet", "Volvo", "Kia", "Jeep", "Dodge",
-        "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia"
+        "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia", "Fiat"
     ]
 
     for index, row in enumerate(rows):
@@ -1731,7 +1832,11 @@ async def scrape_leaderboard(url, table_class="rally_results_stres_right"):
         if len(cols) >= 5:
             pos = cols[0].text.strip()
             name_vehicle = cols[1].text.strip()
-            time = cols[2].text.strip()
+
+            # 🛠 Updated here: Prefer <b> tag inside time column
+            bold_time_tag = cols[2].find("b")
+            time = bold_time_tag.text.strip() if bold_time_tag else cols[2].text.strip()
+
             diff_prev = cols[3].text.strip()
             diff_first = cols[4].text.strip()
 
@@ -1776,6 +1881,7 @@ async def scrape_leaderboard(url, table_class="rally_results_stres_right"):
 
     scraping_logger.info(f"✅ Final leaderboard ({len(leaderboard)} entries) for {url}")
     return leaderboard
+
 
 
 
@@ -2020,6 +2126,11 @@ async def check_current_week_loop(channel):
                     track_name = f"S{season}W{week} - General Leaderboard"
                     previous_leader = await safe_db_call(get_previous_leader, track_name)
 
+                    # 🛡️ NEW: Skip if leader is "Driver"
+                    if not current_leader or current_leader.strip().lower() == "driver":
+                        logging.info(f"⏭️ Skipping fake 'Driver' row for {track_name}")
+                        continue
+
                     if not previous_leader:
                         embed = discord.Embed(
                             title="📍 First One To Complete All The Stages!",
@@ -2057,18 +2168,13 @@ async def check_current_week_loop(channel):
 
                     await safe_db_call(update_previous_leader, track_name, current_leader)
 
+
             await asyncio.sleep(60)
 
         except Exception as e:
             logging.error(f"[Loop Error] {e}")
             await notify_owner_if_stuck()
             await asyncio.sleep(60)
-
-
-
-
-
-
 
 
 
@@ -2141,50 +2247,110 @@ async def check_leader_change():
 
 @bot.event
 async def on_ready():
-    print(f'✅ Logged in as {bot.user}')
-    channel = bot.get_channel(CHANNEL_ID)
+    print(f"✅ Logged in as {bot.user}")
 
-    # ✅ Check if this was a restart (moved to top before anything else)
-    if os.path.exists("restart.flag"):
-        try:
-            with open("restart.flag", "r") as f:
-                restart_channel_id = int(f.read().strip())
-            restart_channel = bot.get_channel(restart_channel_id)
-            if restart_channel:
-                await restart_channel.send("✅ Bot is back up!")
-        except Exception as e:
-            logging.error(f"[ERROR] Failed to send restart confirmation: {e}")
-        finally:
-            os.remove("restart.flag")
+    await load_env_data()
 
-    await process_past_weeks(channel)
+    season_weeks = get_all_season_weeks()
+    print(f"📋 Season/Week keys found: {season_weeks}")
 
-    # 🔍 Debug output
-    weeks = get_all_season_weeks()
-    print("📋 Season/Week keys found:", weeks)
+    latest_season, latest_week = get_latest_season_and_week()
+    await scrape_and_log_week(latest_season, latest_week)
 
-    if not weeks:
-        print("⚠️ No season/week keys found! env_data keys are:", list(env_data.keys()))
+    channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
+    if channel:
+        await channel.send("✅ Bot is back online and ready!")
+
+    start_background_task("check_current_week_loop", check_current_week_loop(channel))
+
+
+
+
+
+
+# ---- Command Handlers ----
+
+async def handle_rescrape_command(message):
+    if message.author.id not in ALLOWED_SYNC_USERS:
+        await message.channel.send("❌ You don’t have permission to use this command.")
         return
 
-    # ✅ Bootstrap current week scraping
-    season, week = get_latest_season_and_week()
+    args = message.content.strip().split()
+
+    if len(args) == 1:
+        # No arguments → FULL rescrape
+        await message.channel.send("🔄 Starting full re-scrape of all seasons and weeks...")
+        season_weeks = get_all_season_weeks()
+
+        tasks = []
+        for sw in season_weeks:
+            season, week = parse_season_week_key(sw)
+            tasks.append(scrape_and_log_week(season, week))
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await message.channel.send("✅ Full re-scrape complete!")
+        return
+
+    arg = args[1].lower()
+
+    if arg.startswith("s") and "w" in arg:
+        # Example: !rescrape s1w2
+        try:
+            season = int(re.findall(r"s(\d+)", arg)[0])
+            week = int(re.findall(r"w(\d+)", arg)[0])
+            await message.channel.send(f"🔄 Re-scraping Season {season}, Week {week}...")
+            await scrape_and_log_week(season, week)
+            await message.channel.send(f"✅ Re-scraped S{season}W{week}!")
+            return
+        except Exception as e:
+            logging.error(f"[Rescrape] Invalid s#w# format: {e}")
+            await message.channel.send("❌ Invalid format. Example: `!rescrape s1w2`")
+            return
+
+    elif arg.startswith("s") and "w" not in arg:
+        # Example: !rescrape s2
+        try:
+            season = int(re.findall(r"s(\d+)", arg)[0])
+            season_weeks = [sw for sw in get_all_season_weeks() if sw.startswith(f"S{season}")]
+            if not season_weeks:
+                await message.channel.send(f"⚠️ No weeks found for Season {season}.")
+                return
+
+            await message.channel.send(f"🔄 Re-scraping all weeks in Season {season} ({len(season_weeks)} weeks)...")
+
+            tasks = []
+            for sw in season_weeks:
+                season_, week = parse_season_week_key(sw)
+                tasks.append(scrape_and_log_week(season_, week))
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await message.channel.send(f"✅ Finished re-scraping all of Season {season}!")
+            return
+        except Exception as e:
+            logging.error(f"[Rescrape] Invalid season format: {e}")
+            await message.channel.send("❌ Invalid format. Example: `!rescrape s2`")
+            return
+
+    else:
+        await message.channel.send("⚠️ Invalid command format. Example: `!rescrape`, `!rescrape s1w3`, or `!rescrape s2`")
+
+
+
+async def scrape_and_log_week(season, week):
     leg_urls = build_urls_for_week(season, week)
+    scrape_tasks = []
 
     for leg, stages in leg_urls.items():
         for stage, url in stages.items():
             if not url:
                 continue
-
             track_name = f"S{season}W{week} - Leg {leg} (Stage {stage})"
-            leaderboard = await scrape_leaderboard(url)
-            if leaderboard:
-                await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week, url)
+            scrape_tasks.append(scrape_and_log_stage(track_name, url, season, week))
 
-                current_leader = await safe_db_call(get_latest_left_leader, track_name, season, week)
-                if current_leader:
-                    await safe_db_call(update_previous_leader, track_name, current_leader)
+    if scrape_tasks:
+        await asyncio.gather(*scrape_tasks, return_exceptions=True)
 
+    # ✅ Now scrape general leaderboard
     leaderboard_url = get_leaderboard_url(season, week)
     if leaderboard_url:
         general_leaderboard, soup = await scrape_general_leaderboard(leaderboard_url)
@@ -2193,13 +2359,17 @@ async def on_ready():
             track_name = f"S{season}W{week} - General Leaderboard"
             await safe_db_call(update_previous_leader, track_name, general_leaderboard[0]["name"])
 
-    start_background_task("check_current_week_loop", check_current_week_loop(channel))
-    start_background_task("reconnect_watchdog_loop", reconnect_watchdog_loop())
+    print(f"✅ Finished scraping and logging S{season}W{week}")
 
 
+async def scrape_and_log_stage(track_name, url, season, week):
+    leaderboard = await scrape_leaderboard(url)
+    if leaderboard:
+        await safe_db_call(log_leaderboard_to_db, track_name, leaderboard, season, week, url)
+        current_leader = await safe_db_call(get_latest_left_leader, track_name, season, week)
+        if current_leader:
+            await safe_db_call(update_previous_leader, track_name, current_leader)
 
-
-# ---- Command Handlers ----
 
 async def handle_progress_command(message):
     parts = message.content.strip().split()
@@ -2478,10 +2648,14 @@ async def handle_search_command(message):
     parts = message.content.strip().split()
 
     if len(parts) < 2:
-        # Fetch all distinct driver names from DB
+        # --- Show dropdown for driver selection ---
         conn = await get_db_connection()
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT DISTINCT driver_name FROM leaderboard_log ORDER BY driver_name ASC LIMIT 25")
+            await cursor.execute("""
+                SELECT DISTINCT driver_name FROM leaderboard_log
+                ORDER BY driver_name ASC
+                LIMIT 25
+            """)
             result = await cursor.fetchall()
         await conn.ensure_closed()
 
@@ -2490,7 +2664,12 @@ async def handle_search_command(message):
             return
 
         names = [row[0] for row in result]
-        await message.channel.send("🔍 Select a driver from the list below:", view=DriverSearchView(names))
+
+        # Send the Driver Dropdown View
+        await message.channel.send(
+            "🔍 Select a driver from the list below:",
+            view=DriverSearchView(names)
+        )
         return
 
     query_name = []
@@ -2505,64 +2684,13 @@ async def handle_search_command(message):
 
     query_name = " ".join(query_name)
 
-    # Match the driver name
-    conn = await get_db_connection()
-    async with conn.cursor() as cursor:
-        await cursor.execute("""
-            SELECT DISTINCT driver_name FROM leaderboard_log
-            WHERE LOWER(driver_name) LIKE %s
-            ORDER BY driver_name ASC LIMIT 1
-        """, (f"%{query_name.lower()}%",))
-        row = await cursor.fetchone()
-    await conn.ensure_closed()
+    # --- Run the search normally if name provided ---
+    embed = await show_driver_results(query_name, season, week)
+    if isinstance(embed, discord.Embed):
+        await message.channel.send(embed=embed)
+    else:
+        await message.channel.send(embed)
 
-    if not row:
-        await message.channel.send(f"❌ No results found for `{query_name}`.")
-        return
-
-    matched_driver = row[0]
-
-    try:
-        result_text = await show_driver_results(matched_driver, season, week)
-        if isinstance(result_text, discord.Embed):
-            # Count stages for current week to show progress info
-            season = season or get_latest_season_and_week()[0]
-            week = week or get_latest_season_and_week()[1]
-            leg_urls = build_urls_for_week(season, week)
-            expected_tracks = [
-                f"S{season}W{week} - Leg {leg} (Stage {stage})"
-                for leg, stages in leg_urls.items()
-                for stage in stages
-            ]
-
-            conn = await get_db_connection()
-            async with conn.cursor() as cursor:
-                await cursor.execute("""
-                    SELECT track_name FROM leaderboard_log_left
-                    WHERE LOWER(driver_name) LIKE %s AND season = %s AND week = %s
-                """, (f"%{matched_driver.lower()}%", season, week))
-                rows = await cursor.fetchall()
-            await conn.ensure_closed()
-
-            completed_tracks = {row[0] for row in rows}
-            total = len(expected_tracks)
-            done = sum(1 for track in expected_tracks if track in completed_tracks)
-
-            if done < total:
-                result_text.add_field(
-                    name="⏱️ Stage Progress",
-                    value=f"{done}/{total} stages completed",
-                    inline=False
-                )
-
-            result_text.set_footer(text=f"Matched: {matched_driver}")
-            await message.channel.send(embed=result_text)
-        else:
-            await message.channel.send(result_text)
-
-    except Exception as e:
-        logging.error(f"[ERROR] search driver failed: {e}")
-        await message.channel.send(f"❌ No results found for `{query_name}`.")
 
 
 
@@ -2593,23 +2721,21 @@ async def handle_stats_command(message):
             await message.channel.send(embed)  # it’s a string error message
 
 
+
 async def handle_restart_command(message):
     if message.author.id not in ALLOWED_SYNC_USERS:
-        await message.channel.send("❌ You don’t have permission to use this command.")
+        await message.channel.send("❌ You don’t have permission to restart the bot.")
         return
 
-    try:
-        # ✅ Write restart flag to disk
-        with open("restart.flag", "w") as f:
-            f.write(str(message.channel.id))
+    await message.channel.send("♻️ Restarting bot...")
 
-        await message.channel.send("🔄 Restarting bot...")
-        await bot.close()
-        sys.exit(0)
+    await asyncio.sleep(1)  # Make sure message sends before shutdown
 
-    except Exception as e:
-        logging.error(f"[ERROR] handle_restart_command failed: {e}")
-        await message.channel.send("❌ Restart failed. Check logs for more info.")
+    os._exit(0)  # 🔥 Force-kill process immediately for clean restart
+
+
+
+
 
 async def handle_compare_command(message):
     pattern = r"!compare (.+?) vs (.+)"
@@ -2805,18 +2931,37 @@ async def handle_leaderboard_command(message):
 
         leaderboard, soup = await scrape_general_leaderboard(leaderboard_url)
 
-        if not leaderboard:
+        # Filter out garbage
+        cleaned_leaderboard = [
+            entry for entry in leaderboard
+            if str(entry.get("position")).isdigit() and entry["name"].strip().lower() != "driver"
+        ]
+
+        # 🔥 Fallback if no real drivers scraped!
+        if not cleaned_leaderboard:
+            logging.warning("[Leaderboard] No real drivers from scrape — using DB fallback.")
+            conn = await get_db_connection()
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute("""
+                    SELECT driver_name AS name, vehicle, time, diff_first, position
+                    FROM general_leaderboard_log
+                    WHERE season = %s AND week = %s
+                    ORDER BY position ASC
+                """, (season, week))
+                cleaned_leaderboard = await cursor.fetchall()
+            await conn.ensure_closed()
+
+        # If still nothing after DB fallback, then truly no entries
+        if not cleaned_leaderboard:
             embed = discord.Embed(
                 title="📭 No Leaderboard Yet",
-                description=(
-                    f"No entries found for **Season {season}, Week {week}**.\n"
-                    "No drivers have completed the rally or submitted times yet."
-                ),
+                description=f"No real driver results found for **Season {season}, Week {week}**.",
                 color=discord.Color.light_grey()
             )
             await message.channel.send(embed=embed)
             return
 
+        # Log the scrape results
         try:
             await safe_db_call(log_general_leaderboard_to_db, season, week, soup)
         except Exception as e:
@@ -2825,18 +2970,22 @@ async def handle_leaderboard_command(message):
         embed = discord.Embed(
             title="🏁 General Leaderboard",
             description=f"**Season {season}, Week {week}**\n\nTop overall times:",
-            color=discord.Color.dark_gold()
+            color=discord.Color.gold()
         )
 
         podium = {1: "🥇", 2: "🥈", 3: "🥉"}
 
-        for entry in leaderboard:
-            pos = int(entry["position"])
+        for entry in cleaned_leaderboard:
+            try:
+                pos = int(entry["position"])
+            except (ValueError, TypeError):
+                pos = 9999
+
             icon = podium.get(pos, f"#{pos}")
             name = entry["name"]
-            vehicle = entry["vehicle"]
-            diff = entry["diff_first"]
-            time = entry["time"]
+            vehicle = entry.get("vehicle", "Unknown")
+            diff = entry.get("diff_first", "N/A")
+            time = entry.get("time", "N/A")
 
             field_title = f"{icon} {name}"
             field_value = (
@@ -2854,6 +3003,258 @@ async def handle_leaderboard_command(message):
         await message.channel.send(f"❌ An error occurred: {e}")
 
 
+
+async def handle_seasonsummary_command(message):
+    try:
+        content = message.content.strip().lower()
+        match = re.search(r"!seasonsummary(?:\s+(s\d+|now))?", content)
+
+        season = None
+        is_current = False
+
+        if match and match.group(1):
+            arg = match.group(1)
+            if arg == "now":
+                all_weeks = get_all_season_weeks()
+                if not all_weeks:
+                    await message.channel.send("❌ No season data found.")
+                    return
+                season, _ = parse_season_week_key(all_weeks[-1])
+                is_current = True
+            else:
+                season = int(arg[1:])  # strip 's' and parse number
+        else:
+            all_weeks = get_all_season_weeks()
+            if not all_weeks:
+                await message.channel.send("❌ No season data found.")
+                return
+            last_season, _ = parse_season_week_key(all_weeks[-1])
+            season = last_season - 1 if last_season > 1 else 1
+
+        # --- Calculate Legs and Stages properly ---
+        legs_count = 0
+        stage_tracks = set()
+
+        for sw in get_all_season_weeks():
+            season_num, week_num = parse_season_week_key(sw)
+            if season_num != season:
+                continue  # skip other seasons
+
+            urls_by_leg = build_urls_for_week(season_num, week_num)
+
+            legs_count += len(urls_by_leg)  # number of legs
+
+            for leg_num, stages_dict in urls_by_leg.items():
+                for stage_num, url in stages_dict.items():
+                    if url:  # Only if URL exists
+                        # Build track name format: S{season}W{week} - Leg {leg} (Stage {stage})
+                        track_name = f"S{season_num}W{week_num} - Leg {leg_num} (Stage {stage_num})"
+                        stage_tracks.add(track_name)
+
+        stages_count = len(stage_tracks)
+
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # Total unique drivers
+            await cursor.execute("""
+                SELECT COUNT(DISTINCT driver_name) AS unique_drivers
+                FROM leaderboard_log_left
+                WHERE season = %s
+            """, (season,))
+            unique_drivers = (await cursor.fetchone())["unique_drivers"]
+
+            # Total points awarded
+            await cursor.execute("""
+                SELECT SUM(points) AS total_points
+                FROM season_points
+                WHERE season = %s
+            """, (season,))
+            total_points = (await cursor.fetchone())["total_points"] or 0
+
+            # Top 3 drivers
+            await cursor.execute("""
+                SELECT driver_name, points
+                FROM season_points
+                WHERE season = %s
+                ORDER BY points DESC
+                LIMIT 3
+            """, (season,))
+            top_drivers = await cursor.fetchall()
+
+            # Total time on track (from general_leaderboard_log)
+            await cursor.execute("""
+                SELECT time
+                FROM general_leaderboard_log
+                WHERE season = %s
+            """, (season,))
+            time_rows = await cursor.fetchall()
+
+            total_seconds = 0
+            for row in time_rows:
+                time_str = row["time"]
+                try:
+                    parts = time_str.split(":")
+                    if len(parts) == 2:  # MM:SS
+                        minutes, seconds = map(float, parts)
+                        total_seconds += (minutes * 60) + seconds
+                    elif len(parts) == 3:  # HH:MM:SS
+                        hours, minutes, seconds = map(float, parts)
+                        total_seconds += (hours * 3600) + (minutes * 60) + seconds
+                except Exception:
+                    continue
+
+            # Most stage wins
+            await cursor.execute("""
+                SELECT driver_name, COUNT(*) AS wins
+                FROM leaderboard_log_left
+                WHERE season = %s AND position = 1
+                GROUP BY driver_name
+                ORDER BY wins DESC
+                LIMIT 1
+            """, (season,))
+            win_row = await cursor.fetchone()
+            most_wins_driver = f"{win_row['driver_name']} ({win_row['wins']} wins)" if win_row else "N/A"
+
+        await conn.ensure_closed()
+
+        # --- Build Embed ---
+        title = f"🏁 Season {season} Summary"
+        if is_current:
+            title += " (Current Season)"
+
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="👥 Unique Drivers", value=unique_drivers, inline=True)
+        embed.add_field(name="🧩 Total Legs", value=legs_count, inline=True)
+        embed.add_field(name="🛣️ Total Stages", value=stages_count, inline=True)
+        embed.add_field(name="🎯 Total Points Awarded", value=total_points, inline=False)
+        if top_drivers:
+            top_text = "\n".join([f"{i+1}. {row['driver_name']} ({row['points']} pts)" for i, row in enumerate(top_drivers)])
+            embed.add_field(name="🏆 Top 3 Drivers", value=top_text, inline=False)
+        embed.add_field(name="⏱️ Total Track Time", value=f"{int(total_seconds // 3600)}h {(int(total_seconds % 3600) // 60)}m", inline=True)
+        embed.add_field(name="🥇 Most Stage Wins", value=most_wins_driver, inline=True)
+
+        await message.channel.send(embed=embed)
+
+    except Exception as e:
+        logging.error(f"[ERROR] seasonsummary command failed: {e}")
+        await message.channel.send("❌ Failed to generate season summary.")
+
+
+
+async def handle_closestfinishes_command(message):
+    try:
+        content = message.content.strip().lower()
+        match = re.search(r"!closestfinishes(?:\s+s(\d+))?", content)
+
+        if match and match.group(1):
+            season = int(match.group(1))
+        else:
+            all_weeks = get_all_season_weeks()
+            last_season, _ = parse_season_week_key(all_weeks[-1])
+            season = last_season - 1 if last_season > 1 else 1
+
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # Fetch all stage results
+            await cursor.execute("""
+                SELECT track_name, driver_name, time
+                FROM leaderboard_log_left
+                WHERE season = %s
+            """, (season,))
+            rows = await cursor.fetchall()
+
+        await conn.ensure_closed()
+
+        if not rows:
+            await message.channel.send("❌ No stage results found for this season.")
+            return
+
+        # Organize by track
+        stage_times = {}
+        for row in rows:
+            time_str = row["time"]
+            if not time_str:
+                continue
+            try:
+                parts = time_str.split(":")
+                if len(parts) == 2:  # MM:SS
+                    minutes, seconds = map(float, parts)
+                    total_seconds = (minutes * 60) + seconds
+                elif len(parts) == 3:  # HH:MM:SS
+                    hours, minutes, seconds = map(float, parts)
+                    total_seconds = (hours * 3600) + (minutes * 60) + seconds
+                else:
+                    continue  # invalid format
+            except Exception:
+                continue  # skip broken times
+
+            track = row["track_name"]
+            if track not in stage_times:
+                stage_times[track] = []
+            stage_times[track].append((row["driver_name"], total_seconds))
+
+        # Find closest gaps
+        gaps = []
+
+        for track, times in stage_times.items():
+            if len(times) < 2:
+                continue  # Skip stages with <2 drivers
+            times_sorted = sorted(times, key=lambda x: x[1])  # sort by time
+            for i in range(len(times_sorted) - 1):
+                driver1, time1 = times_sorted[i]
+                driver2, time2 = times_sorted[i+1]
+                gap = abs(time2 - time1)
+
+                # ➡️ Skip if gap is exactly 0.000 (means identical time, SR fake likely)
+                if gap == 0:
+                    continue
+
+                gaps.append((gap, track, driver1, driver2))
+
+        # Sort gaps
+        gaps_sorted = sorted(gaps, key=lambda x: x[0])
+
+        # Take top 10 closest
+        top_gaps = gaps_sorted[:10]
+
+        embed = discord.Embed(
+            title=f"🏁 Closest Stage Finishes (Season {season})",
+            description="Smallest real time gaps between drivers on a stage (excluding identical times).",
+            color=discord.Color.purple()
+        )
+
+        for idx, (gap, track, driver1, driver2) in enumerate(top_gaps, start=1):
+            embed.add_field(
+                name=f"#{idx}: {track}",
+                value=f"{driver1} vs {driver2}\nGap: {gap:.3f} sec",
+                inline=False
+            )
+
+        await message.channel.send(embed=embed)
+
+    except Exception as e:
+        logging.error(f"[ERROR] closestfinishes command failed: {e}")
+        await message.channel.send("❌ Failed to retrieve closest finishes.")
+
+
+
+
+async def handle_shutdown_command(message):
+    if message.author.id not in ALLOWED_SYNC_USERS:
+        await message.channel.send("❌ You don’t have permission to use this command.")
+        return
+
+    await message.channel.send("🛑 Shutting down the bot gracefully...")
+
+    # 🔥 Step 1: Create shutdown.flag file
+    with open("shutdown.flag", "w") as f:
+        f.write("shutdown")
+
+    # 🔥 Step 2: Then close bot
+    await bot.close()
 
 
 
@@ -2881,7 +3282,9 @@ async def handle_info_command(message):
 
 
 async def handle_cmd_command(message):
-    commands_list = """
+    is_admin = message.author.id in ALLOWED_SYNC_USERS
+
+    public_commands = """
 **📋 Available Commands**
 
 🔍 `!search [driver] [s#w#]`  
@@ -2921,31 +3324,57 @@ async def handle_cmd_command(message):
 → Includes all drivers and vehicle/time breakdown  
 → Uses embed with leaderboard link
 
-💥 `!skillissue`  
-→ Shows last place driver for current week with motivational message
-
 📈 `!points`  
 → Full season standings from database
 
-🔄 `!sync`  
-→ (Admin-only) Syncs rally config + standings from Google Sheets and recalculates points
+🧹 `!seasonsummary [optional: now / s#]`  
+→ Summarize total drivers, legs, stages, points, track time, and top drivers  
+→ Defaults to previous season if no argument
 
-🔁 `!recalpoints`  
-→ (Admin-only) Recalculate points for all previous weeks except current
+🎯 `!closestfinishes [optional: s#]`  
+→ Shows top 10 smallest stage gaps between real drivers  
+→ Skips ties and fake SR times
 
-🩺 `!dbcheck`  
-→ (Admin-only) Test DB connection and show row counts  
-
-♻️ `!restart`  
-→ (Admin-only) Restart the bot
+💥 `!skillissue`  
+→ Shows last place driver for current week with motivational message
 
 ℹ️ `!info`  
 → Rally info like website, password, and rally name from `.env`
 
 🧪 `!cmd`  
 → This command list
-    """
-    await message.channel.send(commands_list)
+"""
+
+    admin_commands = """
+---
+
+🔒 **Admin Commands**
+
+🔄 `!sync`  
+→ Sync rally config + standings from Google Sheets and recalculate points
+
+🔁 `!recalpoints`  
+→ Recalculate points for all previous weeks except current
+
+🩺 `!dbcheck`  
+→ Test DB connection and show row counts
+
+♻️ `!restart`  
+→ Restart the bot
+
+🛑 `!shutdown`  
+→ Turn off the bot safely
+
+🔃 `!rescrape [optional: s#w# or s#]`  
+→ Re-scrape specific week/season or everything if no argument
+"""
+
+    if is_admin:
+        await message.channel.send(public_commands + admin_commands)
+    else:
+        await message.channel.send(public_commands)
+
+
 
 
 @bot.event
@@ -2991,6 +3420,14 @@ async def on_message(message):
         await handle_dbcheck_command(message)
     elif message.content.startswith("!restart"):
         await handle_restart_command(message)
+    elif message.content.split()[0].lower() == "!rescrape":
+        await handle_rescrape_command(message)
+    elif message.content.startswith("!shutdown"):
+        await handle_shutdown_command(message)
+    if message.content.lower().startswith("!seasonsummary"):
+        await handle_seasonsummary_command(message)
+    if message.content.lower().startswith("!closestfinishes"):
+        await handle_closestfinishes_command(message)
     elif message.content.startswith("!recalpoints"):
         await handle_recalpoints_command(message)
 
