@@ -2057,7 +2057,6 @@ async def check_current_week_loop(channel):
 
                     previous_leader = await safe_db_call(get_previous_leader, track_name)
                     if not previous_leader:
-                        # 📍 First stage completion announcement
                         conn = await get_db_connection()
                         async with conn.cursor(aiomysql.DictCursor) as cursor:
                             await cursor.execute("""
@@ -2071,10 +2070,8 @@ async def check_current_week_loop(channel):
                         if row:
                             embed = discord.Embed(
                                 title="📍 First Stage Completion!",
-                                description=(
-                                    f"**{row['driver_name']}** has posted the **first time** on **{track_name}**\n"
-                                    f"🏎️ {row['vehicle']}"
-                                ),
+                                description=(f"**{row['driver_name']}** has posted the **first time** on **{track_name}**\n"
+                                             f"🏎️ {row['vehicle']}"),
                                 color=discord.Color.teal()
                             )
                             await channel.send(embed=embed)
@@ -2105,15 +2102,16 @@ async def check_current_week_loop(channel):
 
                         embed = discord.Embed(
                             title="🏆 New Track Leader!",
-                            description=(
-                                f"**{current_leader}** is now leading **{track_name}**\n"
-                                f"(Previously: {previous_leader}){gain_line}"
-                            ),
+                            description=(f"**{current_leader}** is now leading **{track_name}**\n"
+                                         f"(Previously: {previous_leader}){gain_line}"),
                             color=discord.Color.gold()
                         )
                         await channel.send(embed=embed)
 
                     await safe_db_call(update_previous_leader, track_name, current_leader)
+
+                    # 🔥 NEW: short sleep after each individual stage scrape
+                    await asyncio.sleep(5)
 
             # ✅ GENERAL LEADERBOARD CHECK
             leaderboard_url = get_leaderboard_url(season, week)
@@ -2126,7 +2124,6 @@ async def check_current_week_loop(channel):
                     track_name = f"S{season}W{week} - General Leaderboard"
                     previous_leader = await safe_db_call(get_previous_leader, track_name)
 
-                    # 🛡️ NEW: Skip if leader is "Driver"
                     if not current_leader or current_leader.strip().lower() == "driver":
                         logging.info(f"⏭️ Skipping fake 'Driver' row for {track_name}")
                         continue
@@ -2134,9 +2131,7 @@ async def check_current_week_loop(channel):
                     if not previous_leader:
                         embed = discord.Embed(
                             title="📍 First One To Complete All The Stages!",
-                            description=(
-                                f"**{current_leader}** is the first to post a time on the **general leaderboard** for **S{season}W{week}**!"
-                            ),
+                            description=(f"**{current_leader}** is the first to post a time on the **general leaderboard** for **S{season}W{week}**!"),
                             color=discord.Color.teal()
                         )
                         await channel.send(embed=embed)
@@ -2158,23 +2153,23 @@ async def check_current_week_loop(channel):
 
                         embed = discord.Embed(
                             title="🌐 New Week Leader!",
-                            description=(
-                                f"**{current_leader}** is now leading the overall standings for **S{season}W{week}**\n"
-                                f"(Previously: {previous_leader}){gain_line}"
-                            ),
+                            description=(f"**{current_leader}** is now leading the overall standings for **S{season}W{week}**\n"
+                                         f"(Previously: {previous_leader}){gain_line}"),
                             color=discord.Color.green()
                         )
                         await channel.send(embed=embed)
 
                     await safe_db_call(update_previous_leader, track_name, current_leader)
 
-
-            await asyncio.sleep(60)
-
         except Exception as e:
             logging.error(f"[Loop Error] {e}")
             await notify_owner_if_stuck()
-            await asyncio.sleep(60)
+
+        # 🔥 After everything: full sleep before next cycle
+        logging.info("[LOOP] Sleeping 60 seconds before next scrape...")
+        await asyncio.sleep(60)
+
+
 
 
 
