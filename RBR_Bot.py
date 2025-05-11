@@ -1218,7 +1218,16 @@ async def log_leaderboard_to_db(track_name, leaderboard, season=None, week=None,
 
 async def handle_points_command(message):
     try:
+        # Default to latest season
         season, _ = get_latest_season_and_week()
+
+        # See if user provided an argument like "!points s1"
+        parts = message.content.strip().split()
+        if len(parts) >= 2:
+            arg = parts[1].lower()
+            match = re.match(r"s(\d+)", arg)
+            if match:
+                season = int(match.group(1))
 
         conn = await get_db_connection()
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -1232,7 +1241,7 @@ async def handle_points_command(message):
         await conn.ensure_closed()
 
         if not rows:
-            await message.channel.send("⚠️ No points data found for the current season.")
+            await message.channel.send(f"⚠️ No points data found for Season {season}.")
             return
 
         embed = discord.Embed(
@@ -1257,6 +1266,7 @@ async def handle_points_command(message):
     except Exception as e:
         logging.error(f"[ERROR] handle_points_command failed: {e}")
         await message.channel.send("❌ Could not retrieve points.")
+
 
 
 
@@ -1663,7 +1673,7 @@ async def scrape_left_leaderboard(url, table_class="rally_results_stres_left", m
     headers = {"User-Agent": "Mozilla/5.0"}
     vehicle_starts = ["Citroen", "Ford", "Peugeot", "Opel", "Abarth", "Skoda", "Mitsubishi", "Subaru", "BMW", "GM", "GMC",
                       "Toyota", "Honda", "Suzuki", "Acura", "Audi", "Volkswagen", "Chevrolet", "Volvo", "Kia", "Jeep", "Dodge",
-                      "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia", "Fiat"]
+                      "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia", "Fiat", "VW", "Skoda", "Peugeot"]
 
     for attempt in range(max_retries):
         try:
@@ -1824,7 +1834,7 @@ async def scrape_leaderboard(url, table_class="rally_results_stres_right"):
     vehicle_starts = [
         "Citroen", "Ford", "Peugeot", "Opel", "Abarth", "Skoda", "Mitsubishi", "Subaru", "BMW", "GM", "GMC",
         "Toyota", "Honda", "Suzuki", "Acura", "Audi", "Volkswagen", "Chevrolet", "Volvo", "Kia", "Jeep", "Dodge",
-        "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia", "Fiat"
+        "Mazda", "Hyundai", "Buick", "MINI", "Porsche", "Mercedes", "Land Rover", "Alfa Romeo", "Lancia", "Fiat", "VW", "Skoda", "Peugeot"
     ]
 
     for index, row in enumerate(rows):
@@ -2516,85 +2526,81 @@ async def handle_history_command(message):
         await message.channel.send(f"❌ No history found for `{query_name}`.")
 
 
+class StageLinksView(discord.ui.View):
+    def __init__(self, stage_urls):
+        super().__init__()
+        for stage_num, url in stage_urls.items():
+            if url:
+                self.add_item(discord.ui.Button(label=f"Stage {stage_num}", url=url))
+
 
 async def handle_leg_command(message):
-    parts = message.content.strip().lower().split()
-
-    # Try to extract leg number from either "!leg1" or "!leg 1"
-    leg_number = None
-    if parts[0].startswith("!leg") and len(parts[0]) > 4 and parts[0][4:].isdigit():
-        leg_number = int(parts[0][4:])
-    elif len(parts) > 1 and parts[0] == "!leg" and parts[1].isdigit():
-        leg_number = int(parts[1])
-
-    if leg_number is None:
-        await message.channel.send("❌ Please use a valid leg number like `!leg1` or `!leg 1`.")
-        return
-
-
-        # Default to latest week
-    season, week = get_latest_season_and_week()
-
-    # Check for s#w# argument in parts (even if it's part[2] in "!leg 1 s1w2")
-    for part in parts:
-        if part.startswith("s") and "w" in part:
-            try:
-                season = int(re.findall(r's(\d+)', part)[0])
-                week = int(re.findall(r'w(\d+)', part)[0])
-            except (ValueError, IndexError):
-                await message.channel.send("❌ Invalid format. Use `!leg1` or `!leg1 s2w3`")
-                return
-
-
     try:
+        content = message.content.strip().lower().replace("!leg", "")
+        parts = content.split()
+
+        # Extract leg number from "!leg2" or "!leg 2"
+        leg_part = parts[0] if parts else ""
+        if not leg_part.isdigit():
+            await message.channel.send("⚠️ Usage: `!leg [number] [optional s#w#]` (e.g., `!leg2` or `!leg 2 s1w3`)")
+            return
+        leg_num = int(leg_part)
+
+        # Optional season/week override
+        if len(parts) > 1 and parts[1].startswith("s") and "w" in parts[1]:
+            s, w = parts[1].split("w")
+            season = int(s.replace("s", ""))
+            week = int(w)
+        else:
+            season, week = get_latest_season_and_week()
+
         urls_by_leg = build_urls_for_week(season, week)
-        leg_stage_urls = urls_by_leg.get(leg_number, {})
-        if not leg_stage_urls:
-            await message.channel.send(f"⚠️ No leaderboard data available for Leg {leg_number} in S{season}W{week}.")
+        if leg_num not in urls_by_leg:
+            await message.channel.send(f"❌ No stages found for Leg {leg_num} in S{season}W{week}.")
             return
 
-        embed = discord.Embed(
-            title=f"🧭 Results for Leg {leg_number}",
-            description=f"Season {season}, Week {week}",
-            color=discord.Color.blue()
-        )
+        stage_urls = urls_by_leg[leg_num]
+        conn = await get_db_connection()
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            for stage_num, url in stage_urls.items():
+                track_name = f"S{season}W{week} - Leg {leg_num} (Stage {stage_num})"
 
-        button_links = {}
+                await cursor.execute("""
+                    SELECT position, driver_name, vehicle, diff_first
+                    FROM leaderboard_log_left
+                    WHERE track_name = %s AND season = %s AND week = %s
+                    ORDER BY position ASC
+                    LIMIT 5
+                """, (track_name, season, week))
 
-        for stage_num in sorted(leg_stage_urls):
-            url = leg_stage_urls[stage_num]
-            if not url:
-                continue
+                rows = await cursor.fetchall()
 
-            leaderboard = await scrape_leaderboard(url)
-            if not leaderboard:
-                continue
+                if rows:
+                    results = "\n".join([
+                        f"**{row['position']}**. **{row['driver_name']}** 🏎️ {row['vehicle']} ⏳ ({row['diff_first']})"
+                        for row in rows
+                    ])
+                else:
+                    results = "⚠️ No results yet."
 
-            top_entries = leaderboard[:5]
-            results = "\n".join([
-                f"**{entry['position']}**. **{entry['name']}** 🏎️ {entry['vehicle']} ⏳ ({entry['diff_first']})"
-                for entry in top_entries
-            ])
+                embed = discord.Embed(
+                    title=track_name,
+                    description=results,
+                    color=discord.Color.dark_blue()
+                )
+                await message.channel.send(embed=embed)
 
-            embed.add_field(
-                name=f"Stage {stage_num}",
-                value=(results or "❌ No data") + "\n\u200B",
-                inline=False
-            )
+        await conn.ensure_closed()
 
-
-            button_links[f"Stage {stage_num}"] = url
-
-        if not embed.fields:
-            await message.channel.send("❌ No leaderboard data found for this leg.")
-            return
-
-        view = LeaderboardLinkView(button_links) if button_links else None
-        await message.channel.send(embed=embed, view=view)
+        # Only send the buttons (no text)
+        await message.channel.send(view=StageLinksView(stage_urls))
 
     except Exception as e:
         logging.error(f"[ERROR] handle_leg_command failed: {e}")
-        await message.channel.send(f"❌ An error occurred while processing Leg {leg_number}.")
+        await message.channel.send("❌ An error occurred while fetching leg results.")
+
+
+
 
 
 async def handle_trend_command(message):
@@ -3140,98 +3146,107 @@ async def handle_seasonsummary_command(message):
 
 
 async def handle_closestfinishes_command(message):
+    def parse_diff(diff_str):
+        try:
+            return float(diff_str.replace("+", "").strip())
+        except:
+            return None
+
     try:
+        # Parse message content
         content = message.content.strip().lower()
-        match = re.search(r"!closestfinishes(?:\s+s(\d+))?", content)
+        season, week = get_latest_season_and_week()
 
-        if match and match.group(1):
-            season = int(match.group(1))
-        else:
-            all_weeks = get_all_season_weeks()
-            last_season, _ = parse_season_week_key(all_weeks[-1])
-            season = last_season - 1 if last_season > 1 else 1
+        mode = "week"  # default mode
+        match_full = re.search(r"!closestfinishes\s+s?(\d+)\s*w?(\d+)", content)
+        match_season_only = re.search(r"!closestfinishes\s+s?(\d+)(?!\s*w?\d+)", content)
 
+        if match_full:
+            season = int(match_full.group(1))
+            week = int(match_full.group(2))
+            mode = "week"
+        elif match_season_only:
+            season = int(match_season_only.group(1))
+            mode = "season"
+
+        # 🔎 Prepare query
         conn = await get_db_connection()
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            # Fetch all stage results
-            await cursor.execute("""
-                SELECT track_name, driver_name, time
-                FROM leaderboard_log_left
-                WHERE season = %s
-            """, (season,))
-            rows = await cursor.fetchall()
-
+            if mode == "week":
+                await cursor.execute("""
+                    SELECT season, week, track_name, driver_name, diff_prev, position
+                    FROM leaderboard_log_left
+                    WHERE season = %s AND week = %s AND diff_prev IS NOT NULL AND diff_prev != ''
+                    ORDER BY track_name, position
+                """, (season, week))
+                rows = await cursor.fetchall()
+            else:  # mode == "season"
+                await cursor.execute("""
+                    SELECT season, week, track_name, driver_name, diff_prev, position
+                    FROM leaderboard_log_left
+                    WHERE season = %s AND diff_prev IS NOT NULL AND diff_prev != ''
+                    ORDER BY season, week, track_name, position
+                """, (season,))
+                rows = await cursor.fetchall()
         await conn.ensure_closed()
 
         if not rows:
-            await message.channel.send("❌ No stage results found for this season.")
+            msg = f"❌ No stage results found for S{season}W{week}." if mode == "week" else f"❌ No results found for Season {season}."
+            await message.channel.send(msg)
             return
 
-        # Organize by track
-        stage_times = {}
+        # 📦 Group entries by stage
+        from collections import defaultdict
+        stage_entries = defaultdict(list)
         for row in rows:
-            time_str = row["time"]
-            if not time_str:
-                continue
-            try:
-                parts = time_str.split(":")
-                if len(parts) == 2:  # MM:SS
-                    minutes, seconds = map(float, parts)
-                    total_seconds = (minutes * 60) + seconds
-                elif len(parts) == 3:  # HH:MM:SS
-                    hours, minutes, seconds = map(float, parts)
-                    total_seconds = (hours * 3600) + (minutes * 60) + seconds
-                else:
-                    continue  # invalid format
-            except Exception:
-                continue  # skip broken times
+            key = f"S{row['season']}W{row['week']} - {row['track_name']}"
+            stage_entries[key].append({
+                "driver_name": row["driver_name"],
+                "diff_prev": parse_diff(row["diff_prev"]),
+                "position": row["position"]
+            })
 
-            track = row["track_name"]
-            if track not in stage_times:
-                stage_times[track] = []
-            stage_times[track].append((row["driver_name"], total_seconds))
-
-        # Find closest gaps
+        # 🔢 Build gap list
         gaps = []
-
-        for track, times in stage_times.items():
-            if len(times) < 2:
-                continue  # Skip stages with <2 drivers
-            times_sorted = sorted(times, key=lambda x: x[1])  # sort by time
-            for i in range(len(times_sorted) - 1):
-                driver1, time1 = times_sorted[i]
-                driver2, time2 = times_sorted[i+1]
-                gap = abs(time2 - time1)
-
-                # ➡️ Skip if gap is exactly 0.000 (means identical time, SR fake likely)
-                if gap == 0:
+        for track, entries in stage_entries.items():
+            sorted_entries = sorted(entries, key=lambda x: x["position"])
+            for i in range(1, len(sorted_entries)):
+                current_driver = sorted_entries[i]
+                previous_driver = sorted_entries[i - 1]
+                gap = current_driver["diff_prev"]
+                if gap is None or gap == 0:
                     continue
+                gaps.append((gap, track, previous_driver["driver_name"], current_driver["driver_name"]))
 
-                gaps.append((gap, track, driver1, driver2))
+        if not gaps:
+            await message.channel.send("⚠️ No valid diff comparisons found.")
+            return
 
-        # Sort gaps
-        gaps_sorted = sorted(gaps, key=lambda x: x[0])
+        # 🎯 Top 10 by smallest gap
+        top_gaps = sorted(gaps, key=lambda x: x[0])[:10]
 
-        # Take top 10 closest
-        top_gaps = gaps_sorted[:10]
-
-        embed = discord.Embed(
-            title=f"🏁 Closest Stage Finishes (Season {season})",
-            description="Smallest real time gaps between drivers on a stage (excluding identical times).",
-            color=discord.Color.purple()
+        title = (
+            f"🏁 Closest Stage Finishes (S{season}W{week})" if mode == "week"
+            else f"🏁 Closest Stage Finishes (Season {season})"
         )
 
-        for idx, (gap, track, driver1, driver2) in enumerate(top_gaps, start=1):
+        embed = discord.Embed(title=title, color=discord.Color.purple())
+
+        for i, (gap, track, winner, loser) in enumerate(top_gaps, 1):
             embed.add_field(
-                name=f"#{idx}: {track}",
-                value=f"{driver1} vs {driver2}\nGap: {gap:.3f} sec",
+                name=f"#{i}: {track}",
+                value=(
+                    f"**Winner:** {winner}\n"
+                    f"**Loser:** {loser}\n"
+                    f"**Gap:** `{gap:.3f}` sec"
+                ),
                 inline=False
             )
 
         await message.channel.send(embed=embed)
 
     except Exception as e:
-        logging.error(f"[ERROR] closestfinishes command failed: {e}")
+        logging.error(f"[ERROR] handle_closestfinishes_command failed: {e}")
         await message.channel.send("❌ Failed to retrieve closest finishes.")
 
 
@@ -3319,8 +3334,9 @@ async def handle_cmd_command(message):
 → Includes all drivers and vehicle/time breakdown  
 → Uses embed with leaderboard link
 
-📈 `!points`  
-→ Full season standings from database
+📈 !points [s#]
+→ View full season standings from the database
+→ Add a season (e.g. !points s1) or leave blank for the latest
 
 🧹 `!seasonsummary [optional: now / s#]`  
 → Summarize total drivers, legs, stages, points, track time, and top drivers  
