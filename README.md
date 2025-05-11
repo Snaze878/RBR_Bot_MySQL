@@ -1,99 +1,154 @@
 # 🌟 RBR Discord Bot (MySQL Edition)
 
-Welcome to the **RBR Discord Bot (MySQL Edition)**!  
-This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans.hu/) and posts real-time updates to Discord, enhanced with **MySQL database** integration. Designed for rally communities who want historical tracking, live stat summaries, and automated season management.
+Welcome to the **RBR Discord Bot (MySQL Edition)**!
+This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans.hu/) and posts real-time updates to Discord, powered by **MySQL** integration and advanced stat tracking.
 
 ---
 
 ## 🏎️ Features
 
-- **Automated Leaderboard Updates**  
-  Continuously scrapes and posts the latest standings to your Discord server.
-
-- **Live Leader Change Detection**  
-  Announces when a new driver takes the lead in any rally leg or general standings.
-
-- **MySQL 8.0 Database Backend**  
-  All data is logged asynchronously to a MySQL database using `aiomysql`.
-
-- **Interactive Dropdowns**  
-  Driver and week selection via Discord UI elements.
-
-- **Google Sheets Integration**  
-  Dynamically syncs new rally weeks and configuration from a form submission.
-
-- **Admin-Only Control**  
-  Sync from Google Sheets, rescrape weeks, recalculate points, restart, and shutdown the bot.
-
-- **Driver Stats, Trends & History**  
-  Track individual performance, podiums, weekly progression, and vehicle usage.
-
-- **Stage Completion Progress**  
-  Monitor stage-by-stage progress with ✅/❌ breakdowns.
-
-- **Most Wins Tracker**  
-  Displays top drivers with the most stage wins.
-
-- **Season Summaries**  
-  Recap total legs, stages, drivers, points, and track time at the end of a season.
-
-- **Closest Finishes Tracker**  
-  Highlights the tightest stage battles across an entire season (skipping fake SR times).
-
-- **Custom Points System**  
-  Built-in seasonal points system that calculates standings automatically each week.
-
-- **Archived Data Support**  
-  Past results are cached and accessible via commands.
-
-- **Two Leaderboard Tables**  
-  Logs both LEFT and RIGHT leaderboard panels from rallysimfans.
-
-- **Improved Startup and Scraping Stability**  
-  Optimized backend logic for faster loading and smarter week closure detection.
-
-- **Stability Watchdog**  
-  Auto-alerts if the bot enters a reconnect loop.
+* **Automated Leaderboard Updates** – Scrapes and posts latest standings directly to Discord.
+* **Live Leader Change Detection** – Announces when drivers take the lead in any rally stage.
+* **MySQL 8.0 Database Backend** – All data logged asynchronously using `aiomysql`.
+* **Interactive Dropdowns** – Easily choose drivers or weeks using Discord UI.
+* **Google Sheets Integration** – Syncs rally configs from Google Form submissions.
+* **Admin-Only Controls** – Run syncs, rescrapes, restarts, and more.
+* **Stats, Trends & History** – Track performance over time, podiums, and car usage.
+* **Stage Completion Breakdown** – Shows who has/haven't completed each stage.
+* **Stage Win Tracker** – Highlights most successful drivers per stage.
+* **Season Summaries** – One-command overview of entire season performance.
+* **Closest Finishes Tracker** – Finds top 10 closest real-time stage battles per week or season.
+* **Custom Points System** – Calculates seasonal points automatically.
+* **Full Archived Access** – Query any season/week in history.
+* **Left & Right Leaderboards** – Captures both panels from RallySimFans.hu.
+* **Reconnect Watchdog** – Alerts if bot fails to reconnect or gets stuck.
 
 ---
 
 ## 💬 Commands
 
+### 👤 Driver Commands
+
 ```
-!search [driver] [s#w#]       → Search for a driver's results (dropdown if blank)
-!stats [driver]               → View driver's stats: total events, avg pos, wins, podiums, vehicle, points
-!history [driver]             → Week-by-week positions & gaps on general leaderboard
-!trend [driver]               → Performance trend: arrows, medals, time gaps per week
-!progress [driver]            → Stage-by-stage completion for current week (dropdown if blank)
-!mostwins                     → List top 10 drivers with most stage wins
-!leaderboard [s#w#]           → Show general leaderboard for a week
-!leg1 to !leg6 [s#w#]         → Display top 5 per stage in a rally leg
-!compare driver1 vs driver2   → Head-to-head comparison
-!points                       → Show full season points
-!seasonsummary [optional now or s#] → Summarize a season’s stats (drivers, legs, stages, points, etc.)
-!closestfinishes [optional s#] → Top 10 closest real stage finishes
-!info                         → Rally name, password, and info URL
-!sync                         → Pull new config & data from Google Sheets
-!recalpoints                  → Recalculate points for previous weeks
-!dbcheck                      → Check DB connection and row counts
-!restart                      → Restart the bot
-!shutdown                     → Safely shut down the bot
-!rescrape [s#w# or s#]        → Re-scrape specific week or season
-!cmd                          → List available commands
-!skillissue                   → Show last place driver this week with a motivational message
+!search [driver] [s#w#]        → Driver's full results by stage (dropdown if blank)
+!stats [driver]                → Total events, avg pos, wins, podiums, car, points
+!history [driver]             → Week-by-week position and gap on general leaderboard
+!trend [driver]               → Performance trend across weeks (time, icons, podiums)
+!progress [driver]            → Stage-by-stage completion for current week
 ```
 
-> 🧠 You can also run `!search`, `!stats`, `!history`, `!trend`, or `!progress` with no driver name to use dropdowns!
+### 📈 Leaderboard & Season
+
+```
+!leaderboard [s#w#]           → General leaderboard for a specific week
+!leg1 to !leg6 [s#w#]         → Stage-specific leaderboard for each leg
+!points                       → Full season standings
+!seasonsummary [s# or now]   → Recap of legs, stages, drivers, points
+!mostwins                    → Top 10 most stage wins
+!compare driver1 vs driver2   → Head-to-head breakdown
+!closestfinishes [s# or s#w#] → Top 10 closest real gaps (week or full season)
+```
+
+### 🛠️ Admin Commands
+
+```
+!sync                         → Force sync from Google Sheets
+!rescrape [s#w# or s#]        → Re-scrape week or season
+!recalpoints                  → Recalculate points from DB
+!dbcheck                      → Check DB health and row counts
+!restart                      → Restart the bot
+!shutdown                     → Shut the bot down
+```
+
+### 🎯 Fun / Utility
+
+```
+!cmd                          → Lists all commands
+!info                         → Rally info (name, password, URL)
+!skillissue                   → Motivational message for last-place driver
+```
+
+> 💡 You can run `!search`, `!stats`, `!history`, `!trend`, or `!progress` with no driver name to open dropdown selection.
 
 ---
 
-## 📸 Example Bot Output
+## ⚙️ How It Works
+
+* **Scraping:** Uses `requests` + `BeautifulSoup` to pull data from rallysimfans.hu.
+* **Database:** MySQL schema logs results, stats, and point data.
+* **Bot Framework:** Built on `discord.py` with async task loops and UI elements.
+* **Environment Driven:** URLs, tokens, and sync data pulled from `.env` and Google Sheets.
+* **Offline-Resilient:** DB ops retry automatically if MySQL goes down.
+* **Leader Watch:** Background loops check for leaderboard changes and notify.
+* **Reconnect Watchdog:** Bot notifies if stuck in a reconnect loop.
+
+---
+
+## 🗓️ Installation Guide
+
+### 🔧 Requirements:
+
+* Python 3.10+
+* MySQL 8.0+ running and reachable
+* Discord bot token
+* Google service account JSON file
+
+### 🛠️ Setup Steps
+
+1. Clone this repo:
+
+```bash
+git clone https://github.com/Snaze878/RBR_Bot_MySQL.git
+cd RBR_Bot_MySQL
+```
+
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Set up your `.env` file with:
+
+```
+DISCORD_TOKEN=...
+DB_HOST=...
+DB_USER=...
+DB_PASS=...
+DB_NAME=...
+GOOGLE_SHEET_KEY=...
+```
+
+4. Place your `google_creds.json` in the root folder.
+5. Run the bot:
+
+```bash
+Start_Bot.cmd
+```
+
+---
+
+## 📁 File Structure
+
+```
+RBR_Bot_MySQL/
+├── Start_Bot.cmd              # Launch the bot on Windows
+├── RBR_Bot.py                 # Core bot logic
+├── .env                       # Secrets and config
+├── google_creds.json          # Google Sheets service account
+├── requirements.txt           # Python dependencies
+├── logs/                      # Output logs (daily rotation)
+```
+
+---
+
+## 📸 Example Output
 
 <details>
-<summary>📸 Click to view example bot output</summary>
+<summary>Click to expand</summary>
 
-![General Leaderboard](https://github.com/user-attachments/assets/90b1d28f-da66-4c3d-802e-830d6a74555c)
-![Points Standings](https://github.com/user-attachments/assets/19732ff9-c940-434e-a30d-d2083f5d8f8c)
+![Leaderboard](https://github.com/user-attachments/assets/90b1d28f-da66-4c3d-802e-830d6a74555c)
+![Points](https://github.com/user-attachments/assets/19732ff9-c940-434e-a30d-d2083f5d8f8c)
 ![Search](https://github.com/user-attachments/assets/ec90fb46-e554-4c52-b394-a3755f76c0d3)
 ![Leg](https://github.com/user-attachments/assets/250b7ff8-7e20-4422-9538-f18af0a84f6c)
 ![Stats](https://github.com/user-attachments/assets/7ccdfff6-0e4c-4047-b29c-deb27f43c63f)
@@ -102,49 +157,14 @@ This bot scrapes online leaderboards from [rallysimfans.hu](https://rallysimfans
 
 ---
 
-## ⚙️ How It Works
+## 🤝 Contribute & Support
 
-- **Scraping:** Uses `requests`, `selenium`, and `BeautifulSoup` to gather leaderboard data.
-- **Storage:** Logs results to MySQL tables (`leaderboard_log`, `leaderboard_log_left`, `general_leaderboard_log`, `season_points`, etc.).
-- **Discord Integration:** `discord.py` with rich embeds and dropdown menus.
-- **Dynamic Week/Season Handling:** URLs and settings pulled from `.env` and synced via Google Sheets.
-- **Data Retry:** All DB operations retry if MySQL is temporarily down.
-- **Leader Change Monitoring:** Bot constantly watches for leader swaps during active rallies.
-- **Reconnect Watchdog:** Alerts bot owner if it gets stuck.
+PRs and suggestions welcome! Join the dev/support community:
 
----
-
-## 🗓️ Installation Guide
-
-*(Your install guide steps stay the same — very good already.)*
-
----
-
-## 📃 File Structure
-
-```
-🔍 your_repo/
-🔹 RBR_Bot.py           # Main bot logic
-🔹 Start_Bot.cmd        # Simple launcher for Windows
-🔹 requirements.txt     # Dependencies
-🔹 .env                 # Config for Discord/MySQL/Google
-🔹 google_creds.json    # Google Sheets service account credentials
-🔹 logs/                # Folder for daily logs (commands, scraping, errors)
-```
-
-
----
-
-## 🤝 Contribute & Get Support
-
-Pull requests and bug reports are welcome!  
-Join the support community here:
-
-**[🌐 Discord Support Server](https://discord.gg/HbRaM2taQG)**
+**🌐 [Discord Support Server](https://discord.gg/HbRaM2taQG)**
 
 ---
 
 ## 📜 License
 
-This project is open-source and licensed under the **GNU General Public License v3**.
-
+This project is licensed under the **GNU GPL v3**.
